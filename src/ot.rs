@@ -325,23 +325,21 @@ impl TextOp {
                     out.remove(n);
                     ca.pop_front();
                 }
-                // b deletes text that a inserted
+                // b deletes text that a inserted. Only the deleted prefix is
+                // consumed: anything left of the insert stays pending so the
+                // following components of b can keep or delete it too.
                 (Some(Component::Insert(sa)), Some(Component::Remove(nb))) => {
                     let len = sa.chars().count();
-                    let taken = nb.min(len);
-                    let rest: String = sa.chars().skip(taken).collect();
-                    if !rest.is_empty() {
-                        out.insert(&rest);
-                    }
+                    let take = nb.min(len);
                     ca.pop_front();
-                    if taken == len {
-                        // fully consumed by b's delete; shorten its remove
-                        if nb > len {
-                            cb.pop_front();
-                            cb.push_front(Component::Remove(nb - len));
-                        } else {
-                            cb.pop_front();
-                        }
+                    if take < len {
+                        let rest: String = sa.chars().skip(take).collect();
+                        ca.push_front(Component::Insert(rest));
+                        cb.pop_front();
+                    } else if nb > len {
+                        // the delete consumed the whole insert and still has work
+                        cb.pop_front();
+                        cb.push_front(Component::Remove(nb - len));
                     } else {
                         cb.pop_front();
                     }
@@ -351,12 +349,31 @@ impl TextOp {
                     out.insert(&sb);
                     cb.pop_front();
                 }
-                // a inserts, b keeps it
-                (Some(Component::Insert(sa)), _) => {
+                // a inserts, b keeps only part of it: emit the retained head and
+                // leave the rest of the insert pending, so the following
+                // components of b can consume (or delete) it. Treating the whole
+                // insert as consumed here misaligned the two queues and rejected
+                // perfectly valid compositions.
+                (Some(Component::Insert(sa)), Some(Component::Retain(nb))) => {
                     let len = sa.chars().count();
+                    let take = nb.min(len);
+                    if take > 0 {
+                        let head: String = sa.chars().take(take).collect();
+                        out.insert(&head);
+                    }
+                    ca.pop_front();
+                    if take < len {
+                        let rest: String = sa.chars().skip(take).collect();
+                        ca.push_front(Component::Insert(rest));
+                        cb.pop_front();
+                    } else {
+                        step(&mut cb, take);
+                    }
+                }
+                // a inserts and b is done: the rest of the insert survives
+                (Some(Component::Insert(sa)), None) => {
                     out.insert(&sa);
                     ca.pop_front();
-                    step(&mut cb, len);
                 }
                 (Some(Component::Retain(na)), Some(Component::Retain(nb))) => {
                     let n = na.min(nb);
@@ -404,6 +421,19 @@ fn step(q: &mut VecDeque<Component>, n: usize) {
             }
         }
     }
+}
+
+/// Normalise line endings to `\n`.
+///
+/// Overleaf has no representation for `\r`: document-updater splits snapshots
+/// on `/\r\n|\n|\r/`, and the browser editor deletes every `\r` it finds.
+/// Converting here keeps the mounted file, the OT base and the server in exact
+/// agreement, instead of letting a document drift by one character per read.
+pub fn normalise_newlines(text: &str) -> String {
+    if !text.contains('\r') {
+        return text.to_string();
+    }
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// Split a document string into Overleaf's line array.
@@ -586,6 +616,86 @@ mod tests {
             composed.apply(base).unwrap(),
             b.apply(&a.apply(base).unwrap()).unwrap()
         );
+    }
+
+    #[test]
+    fn compose_second_edit_deletes_part_of_first_insert() {
+        // a appends "YZ", b deletes only the "Z": the composed op must keep "Y".
+        let base = "ab";
+        let mut a = TextOp::new();
+        a.retain(2);
+        a.insert("YZ");
+        let mut b = TextOp::new();
+        b.retain(3);
+        b.remove(1);
+        let composed = TextOp::compose(&a, &b).unwrap();
+        assert_eq!(composed.apply(base).unwrap(), "abY");
+        assert_eq!(
+            composed.apply(base).unwrap(),
+            b.apply(&a.apply(base).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn compose_second_edit_inserts_inside_first_insert() {
+        // a appends "YZ", b inserts "!!" after the "Y": order must be abY!!Z.
+        let base = "ab";
+        let mut a = TextOp::new();
+        a.retain(2);
+        a.insert("YZ");
+        let mut b = TextOp::new();
+        b.retain(3); // "abY"
+        b.insert("!!");
+        b.retain(1); // "Z"
+        let composed = TextOp::compose(&a, &b).unwrap();
+        assert_eq!(composed.apply(base).unwrap(), "abY!!Z");
+        assert_eq!(
+            composed.apply(base).unwrap(),
+            b.apply(&a.apply(base).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn compose_second_edit_deletes_all_of_first_insert() {
+        let base = "ab";
+        let mut a = TextOp::new();
+        a.retain(2);
+        a.insert("YZ");
+        let mut b = TextOp::new();
+        b.retain(2);
+        b.remove(2);
+        let composed = TextOp::compose(&a, &b).unwrap();
+        assert_eq!(composed.apply(base).unwrap(), "ab");
+    }
+
+    #[test]
+    fn compose_insert_consumed_by_multiple_b_components() {
+        // b keeps one character of the insert, deletes the next, keeps the rest.
+        let base = "ab";
+        let mut a = TextOp::new();
+        a.retain(2);
+        a.insert("WXYZ");
+        let mut b = TextOp::new();
+        b.retain(3); // "abW"
+        b.remove(1); // drop "X"
+        b.retain(2); // keep "YZ"
+        let composed = TextOp::compose(&a, &b).unwrap();
+        assert_eq!(composed.apply(base).unwrap(), "abWYZ");
+        assert_eq!(
+            composed.apply(base).unwrap(),
+            b.apply(&a.apply(base).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn newlines_are_normalised_like_overleaf() {
+        // document-updater splits on /\r\n|\n|\r/ and the browser deletes
+        // every '\r', so CR and CRLF both become a plain LF.
+        assert_eq!(normalise_newlines("a\r\nb"), "a\nb");
+        assert_eq!(normalise_newlines("a\rb"), "a\nb");
+        assert_eq!(normalise_newlines("a\nb"), "a\nb");
+        assert_eq!(normalise_newlines("a\r\r\nb"), "a\n\nb");
+        assert_eq!(normalise_newlines(""), "");
     }
 
     #[test]

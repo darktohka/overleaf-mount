@@ -104,6 +104,11 @@ impl OverleafClient {
         // the session cookie on a 302 and reqwest would otherwise drop it.
         let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            // A wedged server must not block a document pump forever: without a
+            // deadline a hung fallback request also blocks the retry that would
+            // have used the (reconnected) socket.
+            .timeout(std::time::Duration::from_secs(20))
+            .connect_timeout(std::time::Duration::from_secs(5))
             .user_agent("overleaf-mount/0.1");
         if let Some(token) = project_token {
             let mut headers = HeaderMap::new();
@@ -548,10 +553,7 @@ impl OverleafClient {
                 if let Some(lines) = v.get("lines").and_then(|l| l.as_array()) {
                     return Ok(Doc {
                         id: doc_id.to_string(),
-                        lines: lines
-                            .iter()
-                            .map(|l| l.as_str().unwrap_or_default().to_string())
-                            .collect(),
+                        lines: flatten_lines(lines),
                         version: v.get("version").and_then(|x| x.as_i64()).unwrap_or(0),
                         ranges: v.get("ranges").cloned().filter(|r| !r.is_null()),
                     });
@@ -855,6 +857,46 @@ fn doc_id_from_add_response(v: &Value) -> Option<String> {
     None
 }
 
+/// Reverse the WebSocket transport escaping Overleaf applies to document lines.
+///
+/// Real-time sends each line of a `sharejs-text-ot` document as
+/// `unescape(encodeURIComponent(line))` — the UTF-8 bytes reinterpreted as
+/// latin1 characters — and the browser reverses it with
+/// `decodeURIComponent(escape(line))`. Without this step non-ASCII text appears
+/// as mojibake (`café` -> `cafÃ©`), sizes are wrong, and every edit after a
+/// multi-byte character is addressed at the wrong offset.
+///
+/// Already-decoded text is returned unchanged: pure ASCII is untouched, and a
+/// non-ASCII string that is not a valid UTF-8 byte sequence (or contains code
+/// points above U+00FF) is passed through.
+pub fn decode_transport_utf8(s: &str) -> String {
+    if s.is_ascii() || s.chars().any(|c| (c as u32) > 0xFF) {
+        return s.to_string();
+    }
+    let bytes: Vec<u8> = s.chars().map(|c| c as u8).collect();
+    match String::from_utf8(bytes) {
+        Ok(decoded) => decoded,
+        Err(_) => s.to_string(),
+    }
+}
+
+/// Normalise the shapes an Overleaf `lines` array can take.
+///
+/// `StringFileData.getLines()` returns `string[]`, but the sharejs model — and
+/// older payloads nested through `doc.lines` — can return an array of character
+/// arrays. Treating those as empty strings silently blanks every document
+/// loaded in that shape.
+pub fn flatten_lines(lines: &[Value]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|l| match l {
+            Value::String(s) => s.clone(),
+            Value::Array(parts) => parts.iter().filter_map(|p| p.as_str()).collect(),
+            _ => String::new(),
+        })
+        .collect()
+}
+
 fn extract_csrf(html: &str) -> Option<String> {
     // Overleaf renders the token twice: a <meta name="ol-csrfToken" content="…">
     // and a hidden input. Accept either, plus the inline JS form and the JSON
@@ -924,4 +966,39 @@ impl std::fmt::Display for Entity {
 pub async fn try_status(client: &OverleafClient) -> bool {
     let url = client.url("/status");
     matches!(client.get(url).await.map(|r| r.status()), Ok(StatusCode::OK))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_transport_utf8;
+
+    #[test]
+    fn decodes_transport_escaped_text() {
+        // `unescape(encodeURIComponent(x))` maps each UTF-8 byte to one char.
+        assert_eq!(decode_transport_utf8("caf\u{00c3}\u{00a9}"), "café");
+        assert_eq!(
+            decode_transport_utf8(
+                "\u{00e6}\u{0097}\u{00a5}\u{00e6}\u{009c}\u{00ac}\u{00e8}\u{00aa}\u{009e}"
+            ),
+            "日本語"
+        );
+        assert_eq!(
+            decode_transport_utf8("\u{00f0}\u{009f}\u{0098}\u{0080}"),
+            "😀"
+        );
+    }
+
+    #[test]
+    fn leaves_ascii_and_already_decoded_text_alone() {
+        assert_eq!(decode_transport_utf8("plain ascii"), "plain ascii");
+        assert_eq!(decode_transport_utf8("café"), "café");
+        assert_eq!(decode_transport_utf8("日本語"), "日本語");
+        assert_eq!(decode_transport_utf8(""), "");
+    }
+
+    #[test]
+    fn leaves_invalid_utf8_byte_sequences_alone() {
+        // U+00E9 alone is not a valid UTF-8 sequence; keep the original.
+        assert_eq!(decode_transport_utf8("caf\u{00e9}"), "caf\u{00e9}");
+    }
 }

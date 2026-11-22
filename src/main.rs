@@ -179,6 +179,7 @@ async fn main() -> Result<()> {
                 debug_ignored(&path);
             }
         }
+    fs.set_ignorer(ignorer);
     }
 
     let engine_task = {

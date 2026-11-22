@@ -5,6 +5,7 @@
 //! `sync/poll.rs`) reads/writes it and wakes the FUSE layer through the
 //! notification kick. That keeps the kernel-facing side free of `.await`.
 
+use crate::gitignore::Ignorer;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -157,6 +158,9 @@ pub struct Fs {
     pub local: RwLock<BTreeMap<u64, Vec<u8>>>,
     /// path -> set of gitignore rules matching it (for logging/stat)
     pub ignored: RwLock<BTreeMap<String, ()>>,
+    /// Live `.gitignore` rules. `ignored` only records paths that existed when
+    /// the rules were loaded; files created later are matched against these.
+    pub ignorer: parking_lot::RwLock<Ignorer>,
     /// Monotonic-ish timestamps/version used to order our own writes.
     pub next_ino: AtomicU64,
     /// Generation counter bumped on every structural or content change; the
@@ -206,6 +210,7 @@ impl Fs {
             docs: RwLock::new(BTreeMap::new()),
             local: RwLock::new(BTreeMap::new()),
             ignored: RwLock::new(BTreeMap::new()),
+            ignorer: parking_lot::RwLock::new(Ignorer::new()),
             next_ino: AtomicU64::new(2),
             generation: AtomicU64::new(1),
             open_handles: AtomicI64::new(0),
@@ -266,6 +271,19 @@ impl Fs {
         let existing = self.lookup(parent, name);
         let ino = match existing {
             Some(ino) => {
+                // A tree refresh re-states every document's kind. Its size must
+                // come from the loaded text, not from the refresh payload (which
+                // passes 0) — otherwise `getattr` reports an empty file and
+                // O_APPEND writes start at offset 0.
+                let size = if matches!(kind, NodeKind::Doc { .. }) {
+                    self.docs
+                        .read()
+                        .get(&ino)
+                        .map(|d| d.text().len() as u64)
+                        .unwrap_or(size)
+                } else {
+                    size
+                };
                 let mut nodes = self.nodes.write();
                 if let Some(n) = nodes.get_mut(&ino) {
                     n.kind = kind;
@@ -449,7 +467,15 @@ impl Fs {
     }
 
     pub fn is_ignored(&self, path: &str) -> bool {
-        self.ignored.read().contains_key(path)
+        if self.ignored.read().contains_key(path) {
+            return true;
+        }
+        !path.is_empty() && self.ignorer.read().is_ignored(path)
+    }
+
+    /// Install the project's `.gitignore` rules (called once, after bootstrap).
+    pub fn set_ignorer(&self, ignorer: Ignorer) {
+        *self.ignorer.write() = ignorer;
     }
 
     pub fn mark_ignored(&self, path: &str, ignored: bool) {
@@ -493,6 +519,19 @@ pub fn is_dir_mode(mode: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gitignore_rules_apply_to_new_paths() {
+        use super::Fs;
+        use crate::gitignore::Ignorer;
+        use std::time::Duration;
+        let fs = Fs::new(0, 0, Duration::from_secs(1));
+        fs.set_ignorer(Ignorer::with_root_rules("build/\n*.aux\n"));
+        // Paths that did not exist when the rules were loaded must match too.
+        assert!(fs.is_ignored("build/output.tex"));
+        assert!(fs.is_ignored("main.aux"));
+        assert!(!fs.is_ignored("main.tex"));
+    }
+
     use super::*;
 
     #[test]

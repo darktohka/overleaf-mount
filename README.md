@@ -70,6 +70,26 @@ Ctrl+C or `SIGTERM` unmounts cleanly, and the mount is created with
 * **Binary uploads** are read-only (`EROFS` on write): Overleaf's OT types have no
   notion of a blob edit.
 
+## Text encoding and line endings
+
+Overleaf's wire format has three details that are easy to get wrong; each one
+used to corrupt documents:
+
+* **Positions are UTF-16 code units**, not characters or bytes. `document-updater`
+  is JavaScript, so an astral character (emoji, some CJK extensions) occupies two
+  units. The OT engine works on Rust `char`s and converts at the wire boundary,
+  rejecting offsets that would split a surrogate pair.
+* **`joinDoc` lines are transport-escaped.** Real-time sends each line as
+  `unescape(encodeURIComponent(line))` ("so it can go via WebSockets") and the
+  browser reverses it with `decodeURIComponent(escape(line))`. The mount decodes
+  them; skipping the step shows `café` as `cafÃ©`, reports wrong sizes, and
+  addresses edits at the wrong offset. `otUpdateApplied` operations are **not**
+  escaped.
+* **There is no carriage return in Overleaf's model.** `document-updater` splits
+  snapshots on `/\r\n|\n|\r/` and the browser deletes every `\r`. The mounted
+  view is therefore normalised to LF, while the OT base keeps the server's exact
+  bytes so positions and deleted text always match what the server holds.
+
 ## How synchronisation works
 
 ### The live path
@@ -167,40 +187,81 @@ must survive its shell going away, and installing a handler would override
 | `src/fuse.rs` | FUSE callbacks. All of them touch memory only; writes hand a sequenced intent to the engine so a network round-trip never blocks a kernel thread. |
 | `src/gitignore.rs` | Ancestor-aware matching over the `ignore` crate's matchers. |
 
+Two more invariants, learned from races the suites now pin down:
+
+* **Write intents carry the inode, not the document id.** A file created with
+  `create(2)` has only a `pending:` id until `add_doc` returns; writes issued in
+  between must still reach the real document once it exists.
+* **A late `joinDoc` must not overwrite unconfirmed bytes.** Snapshots update the
+  OT base but leave the mounted text alone while `desired` holds a local edit;
+  and bootstrap retries missing snapshots instead of treating a document as
+  empty (an empty base would make the next write delete everything).
+
 ## Tests
 
+Run everything, lightest layer first:
+
 ```sh
-cd overleaf-mount && cargo test --lib     # 29 unit tests
+dev-server/bin/test.sh                    # cargo tests + mock race suite
+dev-server/bin/test.sh --project <id>     # + real-stack stress and end-to-end scenarios
 ```
 
-Covers OT transform/compose invariants plus a 2000-round convergence fuzz,
-rebase of a local change onto a collaborator's edit, wire-format round-trips
-(positional and component forms), gitignore ancestor rules, chmod/chown and the
-`.sh` default mode.
-
-End-to-end scenarios:
+### 1. Rust tests — text model, wire codec, OT
 
 ```sh
-dev-server/bin/dev.sh start
-cd overleaf/services/web && yarn node scripts/dev-fixture.mjs   # prints PROJECT_ID=
+cd overleaf-mount && cargo test
+```
+
+**98 test functions** in four binaries:
+
+| Binary | What it pins down |
+| --- | --- |
+| `src` unit tests (44) | OT transform/compose invariants, 2 000-round convergence fuzz, rebase, wire round-trips including UTF-16 and astral characters, transport decoding, newline normalisation, gitignore, chmod/chown, `.sh` mode |
+| `tests/text_model.rs` (26) | diff/apply over 600 random cases with `\n \r \t " \\ é 日本語 😀 𝄞` and combining accents; 2 200 transform pairs plus an exhaustive 15 876-pair probe; compose; edge text (empty, BOM, `\0`, CRLF-only, 1 MB single line) |
+| `tests/wire_codec.rs` (20) | exact wire sizes; UTF-16 positions after astral characters; astral deletes; surrogate-pair rejection; positional and component forms; 350 random round-trips |
+| `tests/line_shapes.rs` (8) | `joinDoc` lines as strings and as character arrays |
+
+The minimality requirement is asserted with exact numbers, e.g. a one-character
+insert into a 100 KB document produces a **21-byte** wire operation
+(`[{"i":"X","p":51221}]`), a one-character delete from 200 KB produces **22
+bytes**, and a 5-character insert into 120 KB produces **25 bytes**.
+
+### 2. Deterministic race suite — no dev stack
+
+```sh
+node dev-server/bin/race-suite.mjs
+```
+
+Starts `dev-server/mock/server.mjs` (builtins-only HTTP + socket.io 0.9 mock) on
+an ephemeral port and drives the real binary against it, one fresh mount per
+scenario: 17 scenarios / 77 checks, ~30 s. It injects what a real network does
+only occasionally — duplicate acks and echoes, delayed acks racing a remote op,
+drops before the ack, out-of-order and stale updates, outages in the middle of a
+burst — and asserts both final text and the exact operations the client sent.
+
+### 3. Real-stack stress suite
+
+```sh
+node dev-server/bin/stress.mjs --project <id>
+```
+
+38 checks against the real `document-updater`: small-edit efficiency on a 300 KB
+document (a 10-character edit sends a **32-byte** op), 40 appends coalescing into
+one operation, Unicode/emoji offsets, CRLF and trailing-newline semantics,
+collaborator edits during mount startup, four peers on disjoint regions, a
+three-way same-sentence rewrite, delete-vs-insert at one offset, 30
+open/write/close cycles, create → edit → delete, and idle stability.
+
+### 4. End-to-end scenarios — FUSE behaviour
+
+```sh
 node dev-server/bin/scenarios.mjs --project <id>
 ```
 
-`dev-server/bin/scenarios.mjs` starts and stops the mount itself and prints the
-evidence for each case:
-
-| Scenario | Proves |
-| --- | --- |
-| mount starts / lists / content | the project image is correct before any I/O |
-| write on the mount | local `write(2)` reaches document-updater |
-| peer edit | a collaborator's edit appears on the mount |
-| concurrent edits | both edits survive, transformed by the server |
-| same-sentence rewrite | both rewrites survive and the document stays parseable |
-| `.gitignore` | matched files stay local; the server tree does not grow |
-| `.sh` mode, chmod, uid/gid | executable default, in-memory chmod, ownership |
-| `SIGTERM` | the mount is unmounted |
-| no websocket | the mount still starts and serves correct content |
-| real-time outage | an edit made while real-time is down is delivered after reconnect |
+15 checks: listing/content, mount→server and peer→mount writes, concurrent and
+same-sentence edits, `.gitignore`, `.sh` mode, chmod/setuid, uid/gid, `SIGTERM`
+unmount, HTTP fallback without a websocket, and an edit made during a real-time
+outage being delivered after reconnect.
 
 `dev-server/bin/peer.mjs` is a standalone "browser" that joins a document and
 applies an edit; `peer-lib.mjs` holds the shared session/socket code (including

@@ -110,7 +110,7 @@ impl OverleafFs {
                 .map(|d| d.text())
                 .unwrap_or_default();
             self.sync.send(Outgoing::WriteDoc {
-                doc_id,
+                ino,
                 text,
                 seq: self.write_seq.fetch_add(1, Ordering::SeqCst),
             });
@@ -235,7 +235,7 @@ impl Filesystem for OverleafFs {
                     data.resize(new_size as usize, 0);
                     match node.kind {
                         NodeKind::Doc { ref doc_id, .. } => {
-                            let text = String::from_utf8_lossy(&data).to_string();
+                            let text = crate::ot::normalise_newlines(&String::from_utf8_lossy(&data));
                             let mut doc = self
                                 .fs
                                 .doc(ino)
@@ -311,7 +311,7 @@ impl Filesystem for OverleafFs {
             return reply.error(libc::ENOTEMPTY);
         }
         self.fs.remove(ino);
-        self.sync.send(Outgoing::Delete { ino });
+        self.sync.send(Outgoing::Delete { ino, doc_id: None });
         reply.ok();
     }
 
@@ -322,8 +322,15 @@ impl Filesystem for OverleafFs {
         let Some(ino) = self.fs.lookup(parent, name) else {
             return reply.error(libc::ENOENT);
         };
+        // Capture the document id *before* removing the node: the engine runs
+        // asynchronously, so by the time it handles the intent the inode is
+        // gone and the server document would never be deleted.
+        let doc_id = match self.fs.node(ino).map(|n| n.kind) {
+            Some(NodeKind::Doc { doc_id, .. }) => Some(doc_id),
+            _ => None,
+        };
         self.fs.remove(ino);
-        self.sync.send(Outgoing::Delete { ino });
+        self.sync.send(Outgoing::Delete { ino, doc_id });
         reply.ok();
     }
 
@@ -424,7 +431,7 @@ impl Filesystem for OverleafFs {
         }
         match node.kind {
             NodeKind::Doc { doc_id, .. } => {
-                let text = String::from_utf8_lossy(&buf).to_string();
+                let text = crate::ot::normalise_newlines(&String::from_utf8_lossy(&buf));
                 let mut doc = self.fs.doc(ino).unwrap_or(Doc {
                     id: doc_id.clone(),
                     lines: vec![String::new()],

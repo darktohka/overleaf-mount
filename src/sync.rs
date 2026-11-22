@@ -59,7 +59,11 @@ pub enum Outgoing {
     /// arrive out of order (the kernel can deliver `truncate(0)` after the
     /// `write(2)` that follows it, and honouring both would empty the file).
     WriteDoc {
-        doc_id: String,
+        /// The inode, not the document id: a document created with `create(2)`
+        /// has only a `pending:<path>` placeholder until the server round-trip
+        /// completes, and writes issued in the meantime must still reach the
+        /// real document once it exists.
+        ino: u64,
         text: String,
         seq: u64,
     },
@@ -67,7 +71,7 @@ pub enum Outgoing {
     CreateDoc { parent: u64, name: String, text: String },
     CreateDir { parent: u64, name: String },
     Rename { ino: u64, new_parent: u64, new_name: String },
-    Delete { ino: u64 },
+    Delete { ino: u64, doc_id: Option<String> },
 }
 
 /// What we are waiting for when an acknowledgement frame arrives.
@@ -174,12 +178,19 @@ pub struct SyncEngine {
     acks: Mutex<HashMap<u64, Ack>>,
     /// Signalled as soon as the project tree has been received over the socket.
     ready: tokio::sync::Notify,
+    /// Documents whose content is not known yet. A write to one of these must
+    /// fetch the document before diffing: an empty base would delete everything.
+    unknown_content: Mutex<std::collections::HashSet<String>>,
     /// Number of documents whose initial `joinDoc` snapshot is still outstanding.
     pending_docs: Mutex<usize>,
     /// Signalled once every initial document snapshot has arrived.
     contents_ready: tokio::sync::Notify,
     ack_counter: std::sync::atomic::AtomicU64,
     pub socket_up: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether a socket connection has ever succeeded. Distinguishes a
+    /// transient drop (wait for the supervisor to reconnect) from a server
+    /// that has no real-time service at all (use HTTP immediately).
+    ever_connected: std::sync::atomic::AtomicBool,
 }
 
 impl SyncEngine {
@@ -207,10 +218,12 @@ impl SyncEngine {
             confirm: Mutex::new(HashMap::new()),
             acks: Mutex::new(HashMap::new()),
             ready: tokio::sync::Notify::new(),
+            unknown_content: Mutex::new(std::collections::HashSet::new()),
             pending_docs: Mutex::new(0),
             contents_ready: tokio::sync::Notify::new(),
             ack_counter: std::sync::atomic::AtomicU64::new(1),
             socket_up: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ever_connected: std::sync::atomic::AtomicBool::new(false),
         });
         (engine, SyncHandle { tx })
     }
@@ -231,13 +244,53 @@ impl SyncEngine {
         });
         let ready = tokio::time::timeout(Duration::from_secs(10), self.ready.notified()).await;
         if ready.is_ok() {
-            // The tree is here; wait briefly for the document snapshots so the
-            // mount is usable the moment it appears.
-            if tokio::time::timeout(Duration::from_secs(10), self.contents_ready.notified())
-                .await
-                .is_err()
-            {
-                warn!("some document contents did not load before the mount started");
+            // The tree is here; wait for the document snapshots so the mount is
+            // usable the moment it appears. A single dropped `joinDoc` ack must
+            // not leave a document looking empty (a write would then be diffed
+            // against "" and wipe it), so retry whatever is still missing.
+            // One wait for the initial batch; further waits only happen after
+            // an actual retry (waiting again when everything already arrived
+            // would add ten seconds to every mount).
+            let _ = tokio::time::timeout(
+                Duration::from_secs(10),
+                self.contents_ready.notified(),
+            )
+            .await;
+            for attempt in 0..4 {
+                let all: Vec<String> = self.fs.doc_inodes.read().keys().cloned().collect();
+                let synced = self.synced.lock().await;
+                let missing: Vec<String> = all
+                    .into_iter()
+                    .filter(|id| !synced.contains_key(id))
+                    .collect();
+                drop(synced);
+                if missing.is_empty() {
+                    break;
+                }
+                if attempt < 3 {
+                    warn!(
+                        "{} document(s) did not return a snapshot yet; retrying",
+                        missing.len()
+                    );
+                    for doc_id in missing {
+                        self.request_join_doc(&doc_id).await;
+                    }
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        self.contents_ready.notified(),
+                    )
+                    .await;
+                } else {
+                    warn!(
+                        "{} document(s) still have no content; they will be fetched on demand",
+                        missing.len()
+                    );
+                    // Never treat an unknown document as empty: remember that the
+                    // base is unknown so a local write fetches it first.
+                    for doc_id in missing {
+                        self.unknown_content.lock().await.insert(doc_id);
+                    }
+                }
             }
         }
         if ready.is_err() {
@@ -359,8 +412,8 @@ impl SyncEngine {
             };
             let Some(ev) = ev else { return Ok(()) };
             let res = match ev {
-                Outgoing::WriteDoc { doc_id, text, seq } => {
-                    self.clone().request_write(doc_id, text, seq).await;
+                Outgoing::WriteDoc { ino, text, seq } => {
+                    self.clone().request_write(ino, text, seq).await;
                     Ok(())
                 }
                 Outgoing::CreateDoc {
@@ -374,7 +427,7 @@ impl SyncEngine {
                     new_parent,
                     new_name,
                 } => self.rename(ino, new_parent, &new_name).await,
-                Outgoing::Delete { ino } => self.delete(ino).await,
+                Outgoing::Delete { ino, doc_id } => self.delete(ino, doc_id).await,
             };
             if let Err(e) = res {
                 warn!("sync error: {e:#}");
@@ -385,7 +438,11 @@ impl SyncEngine {
     /// Record that `doc_id` should hold `text`, and make sure a pump is running
     /// for it. Returns immediately: the network round-trip happens off the FUSE
     /// thread, and repeated writes to the same document collapse into one.
-    async fn request_write(self: Arc<Self>, doc_id: String, text: String, seq: u64) {
+    async fn request_write(self: Arc<Self>, ino: u64, text: String, seq: u64) {
+        let doc_id = match self.fs.node(ino).map(|n| n.kind) {
+            Some(NodeKind::Doc { doc_id, .. }) if !doc_id.starts_with("pending:") => doc_id,
+            _ => return,
+        };
         {
             let mut latest = self.latest_seq.lock().await;
             match latest.get(&doc_id) {
@@ -487,6 +544,24 @@ impl SyncEngine {
                 continue;
             }
 
+            if self.unknown_content.lock().await.contains(doc_id) {
+                // The content never arrived. Fetch it before computing a diff;
+                // an empty base would make this write delete the document.
+                debug!("doc {doc_id}: content unknown; fetching before pushing");
+                self.resync_doc(doc_id).await;
+                for _ in 0..50 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if !self.unknown_content.lock().await.contains(doc_id) {
+                        break;
+                    }
+                }
+                if self.unknown_content.lock().await.contains(doc_id) {
+                    // Keep `desired`: the write is retried once the snapshot
+                    // arrives (or on the next local edit).
+                    return Ok(());
+                }
+                continue;
+            }
             let (base, version) = self.doc_base(doc_id).await;
             let from = self
                 .desired_from
@@ -498,7 +573,27 @@ impl SyncEngine {
             // Rebase the local change onto whatever the server holds now, so a
             // collaborator's concurrent edit is kept instead of being overwritten
             // by our snapshot of the file.
-            let target = rebase_local(&from, &want, &base);
+            // If the server already holds exactly the text we want, the edit
+            // landed (for example its acknowledgement was lost with a socket
+            // that died after the frame was sent). Re-sending it would insert
+            // the same text again: OT sees two identical inserts, not a retry.
+            if base == want {
+                debug!("doc {doc_id}: server already holds the desired text");
+                self.desired.lock().await.remove(doc_id);
+                self.desired_from.lock().await.remove(doc_id);
+                return Ok(());
+            }
+
+            // The server text may already be a prefix of what we want: our
+            // earlier ops reached it while the acknowledgement was lost, or a
+            // burst was partially applied before a disconnect. Rebasing that as
+            // if it were a *concurrent* edit re-inserts our own text (it showed
+            // up two or three times). Only the missing suffix needs sending.
+            let target = if base.starts_with(&from) && want.starts_with(&base) {
+                want.clone()
+            } else {
+                crate::ot::normalise_newlines(&rebase_local(&from, &want, &base))
+            };
 
             if base == target {
                 let unchanged = self
@@ -521,6 +616,41 @@ impl SyncEngine {
                 return Ok(());
             }
             let (ins, del) = op.change_size();
+
+            if !self.socket_up.load(std::sync::atomic::Ordering::SeqCst) {
+                // A socket drop is usually transient: real-time disconnects a
+                // client when a just-created document is not authorised yet, and
+                // the supervisor reconnects within a couple of seconds. Prefer
+                // waiting for it over shoving a whole document through web's
+                // private API (which, for a fresh document, may not even know it
+                // exists yet — that used to lose edits made right after create).
+                // A server with real-time is expected to come back; its
+                // supervisor retries every couple of seconds, and a restart of
+                // the service can take longer than that. Only fall back to
+                // whole-document HTTP when we have never had a socket, or after
+                // a generous grace period.
+                let attempts = if self
+                    .ever_connected
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    150
+                } else {
+                    50
+                };
+                for _ in 0..attempts {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if self.socket_up.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    let pending = self.desired.lock().await.get(doc_id).cloned();
+                    match pending {
+                        // Nothing left to send, or a newer write superseded this.
+                        None => return Ok(()),
+                        Some(p) if p != want => break,
+                        _ => {}
+                    }
+                }
+            }
 
             if self.socket_up.load(std::sync::atomic::Ordering::SeqCst) {
                 let mut rx = self.confirm_channel(doc_id).await;
@@ -556,6 +686,7 @@ impl SyncEngine {
 
             // HTTP fallback: PUT the whole document. Overleaf turns the new text
             // into an update itself, so other editors see a normal edit.
+            info!("doc {doc_id}: socket unavailable, pushing the whole document over HTTP");
             let lines: Vec<String> = want.split('\n').map(String::from).collect();
             let ranges = self.fs.doc_inodes.read().get(doc_id).copied()
                 .and_then(|ino| self.fs.doc(ino))
@@ -599,12 +730,12 @@ impl SyncEngine {
     }
 
     async fn create_doc(self: &Arc<Self>, parent: u64, name: &str, text: &str) -> Result<()> {
-        let lines: Vec<String> = text.split('\n').map(String::from).collect();
+        let initial: Vec<String> = crate::ot::split_lines(text);
         let doc_id = if self.fs.is_ignored(&self.fs.path_of(parent)) {
             // local-only file: nothing to do
             return Ok(());
         } else {
-            self.client.add_doc(name, &lines).await?
+            self.client.add_doc(name, &initial).await?
         };
         let ino = self.fs.upsert(
             parent,
@@ -613,25 +744,55 @@ impl SyncEngine {
                 doc_id: doc_id.clone(),
                 ranges: None,
             },
-            text.len() as u64,
+            0,
         );
-        self.fs.doc_inodes.write().insert(doc_id.clone(), ino);
+
+        // `create(2)` is immediately followed by `write(2)`; those writes land on
+        // the in-memory node (whose id is still `pending:`) while this task is
+        // waiting for the server. Do not replace them with the snapshot that
+        // started the request — doing so truncated every freshly created file
+        // back to its initial (usually empty) content.
+        let current = self.fs.doc(ino).map(|d| d.text()).unwrap_or_default();
+        let content = if current.is_empty() {
+            text.to_string()
+        } else {
+            current
+        };
+        let content = crate::ot::normalise_newlines(&content);
+
+        // Publish the base *before* the id becomes visible to the socket task:
+        // a late `joinDoc` for the (still empty) server document must not
+        // overwrite bytes the user has already written. `desired` marks them as
+        // unconfirmed, and `doc_base` must use the server's text (`text`), not
+        // the visible file, or the pump would think there is nothing to send.
         self.fs.set_doc(
             ino,
             Doc {
                 id: doc_id.clone(),
-                lines,
+                lines: crate::ot::split_lines(&content),
                 version: 0,
                 ranges: None,
             },
         );
+        self.synced
+            .lock()
+            .await
+            .insert(doc_id.clone(), (text.to_string(), 0));
         self.versions.lock().await.insert(doc_id.clone(), 0);
+        if !content.is_empty() {
+            self.desired
+                .lock()
+                .await
+                .insert(doc_id.clone(), content.clone());
+            self.desired_from
+                .lock()
+                .await
+                .insert(doc_id.clone(), text.to_string());
+        }
+        self.fs.doc_inodes.write().insert(doc_id.clone(), ino);
         self.notifier.tree_changed();
-        // Content written before the server id existed is sitting in the
-        // in-memory image; push it now that the document is real.
-        let text = self.fs.doc(ino).map(|d| d.text()).unwrap_or_default();
-        if !text.is_empty() {
-            self.clone().request_write(doc_id.clone(), text, 0).await;
+        if !content.is_empty() {
+            self.clone().request_write(ino, content, 0).await;
         }
         debug!("created document {doc_id}");
         Ok(())
@@ -683,18 +844,23 @@ impl SyncEngine {
         Ok(())
     }
 
-    async fn delete(&self, ino: u64) -> Result<()> {
-        let path = self.fs.path_of(ino);
-        if self.fs.is_ignored(&path) {
+    async fn delete(&self, ino: u64, doc_id: Option<String>) -> Result<()> {
+        let Some(doc_id) = doc_id else {
+            return Ok(()); // directory or local-only file
+        };
+        if doc_id.starts_with("pending:") {
+            // Never created on the server (or still being created); nothing to do.
             return Ok(());
         }
-        if let Some(node) = self.fs.node(ino) {
-            if let NodeKind::Doc { doc_id, .. } = &node.kind {
-                if let Err(e) = self.client.delete_doc(doc_id).await {
-                    warn!("could not delete doc {doc_id} on the server: {e:#}");
-                }
-            }
+        if let Err(e) = self.client.delete_doc(&doc_id).await {
+            warn!("could not delete doc {doc_id} on the server: {e:#}");
         }
+        self.fs.doc_inodes.write().remove(&doc_id);
+        self.synced.lock().await.remove(&doc_id);
+        self.desired.lock().await.remove(&doc_id);
+        self.desired_from.lock().await.remove(&doc_id);
+        self.versions.lock().await.remove(&doc_id);
+        let _ = ino;
         Ok(())
     }
 
@@ -781,6 +947,8 @@ impl SyncEngine {
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
         *self.socket_tx.lock().await = Some(out_tx);
         self.socket_up
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.ever_connected
             .store(true, std::sync::atomic::Ordering::SeqCst);
         *self.acks.lock().await = HashMap::new();
 
@@ -1059,40 +1227,64 @@ impl SyncEngine {
 
     /// `joinDoc` acknowledgement: `[null, lines, version, ops, ranges, type, …]`.
     async fn on_join_doc_ack(&self, doc_id: &str, payload: &Value) {
-        {
-            let mut pending = self.pending_docs.lock().await;
-            if *pending > 0 {
-                *pending -= 1;
-                if *pending == 0 {
-                    self.contents_ready.notify_one();
-                }
-            }
-        }
         let arr = match payload.as_array() {
             Some(a) => a,
-            None => return,
+            None => {
+                self.note_contents_loaded().await;
+                return;
+            }
         };
         if let Some(err) = arr.first().filter(|e| !e.is_null()) {
             debug!("joinDoc({doc_id}) error: {err}");
+            self.note_contents_loaded().await;
             return;
         }
+        // `lines` is normally `string[]`; the sharejs model can hand back one
+        // array of characters per line instead. Both must be preserved — the
+        // old "array means empty line" shortcut blanked such documents.
+        //
+        // For `sharejs-text-ot` documents real-time additionally escapes each
+        // line with `unescape(encodeURIComponent(line))` before putting it on
+        // the socket ("so it can go via WebSockets"), and the browser decodes
+        // it again. Without the reverse step every non-ASCII document shows up
+        // as mojibake and edit offsets are computed against the wrong text.
+        let history_ot = arr
+            .get(5)
+            .and_then(|t| t.as_str())
+            .map(|t| t == "history-ot")
+            .unwrap_or(false);
         let lines: Vec<String> = arr
             .get(1)
             .and_then(|l| l.as_array())
             .map(|a| {
-                a.iter()
-                    .filter_map(|x| {
-                        x.as_str()
-                            .map(String::from)
-                            // lines may arrive escaped (array of chars/nulls)
-                            .or_else(|| x.as_array().map(|_| String::new()))
-                    })
-                    .collect()
+                let lines = crate::overleaf::flatten_lines(a);
+                if history_ot {
+                    lines
+                } else {
+                    lines
+                        .into_iter()
+                        .map(|l| crate::overleaf::decode_transport_utf8(&l))
+                        .collect()
+                }
             })
             .unwrap_or_default();
         let version = arr.get(2).and_then(|v| v.as_i64()).unwrap_or(0);
         let ranges = arr.get(4).cloned().filter(|r| !r.is_null());
         self.store_remote_doc_full(doc_id, lines, version, ranges).await;
+        // Only now is `synced` populated: signalling before the store made
+        // bootstrap observe "missing" for a document that had just arrived.
+        self.note_contents_loaded().await;
+    }
+
+    /// One initial document snapshot is done.
+    async fn note_contents_loaded(&self) {
+        let mut pending = self.pending_docs.lock().await;
+        if *pending > 0 {
+            *pending -= 1;
+            if *pending == 0 {
+                self.contents_ready.notify_one();
+            }
+        }
     }
 
     async fn store_remote_doc_full(
@@ -1106,17 +1298,39 @@ impl SyncEngine {
             Some(i) => *i,
             None => return,
         };
+        self.unknown_content.lock().await.remove(doc_id);
+        // The OT base must be the server's text *exactly* — including any
+        // carriage returns that arrived as line separators. Only the mounted
+        // view is normalised to LF. Diffing against the normalised view would
+        // compute positions that do not exist in the server's document (and
+        // corrupt it on the next edit).
+        let raw = lines.join("\n");
+        let view = crate::ot::normalise_newlines(&raw);
+        if self.desired.lock().await.contains_key(doc_id) {
+            // There is local text this snapshot does not contain (the document
+            // was created or edited moments ago). Adopt the server's base so the
+            // pump can rebase onto it, but do not overwrite the mounted file.
+            self.synced
+                .lock()
+                .await
+                .insert(doc_id.to_string(), (raw, version));
+            self.versions
+                .lock()
+                .await
+                .insert(doc_id.to_string(), version);
+            self.bump_confirm(doc_id).await;
+            return;
+        }
         let current = self.fs.doc(ino);
         let changed = current
             .as_ref()
-            .map(|d| d.lines != lines)
+            .map(|d| d.text() != view)
             .unwrap_or(true);
-        let text = lines.join("\n");
         self.fs.set_doc(
             ino,
             Doc {
                 id: doc_id.to_string(),
-                lines,
+                lines: crate::ot::split_lines(&view),
                 version,
                 ranges,
             },
@@ -1128,7 +1342,7 @@ impl SyncEngine {
         self.synced
             .lock()
             .await
-            .insert(doc_id.to_string(), (text, version));
+            .insert(doc_id.to_string(), (raw, version));
         self.bump_confirm(doc_id).await;
         if changed {
             self.notifier.invalidate(ino);
@@ -1275,7 +1489,7 @@ impl SyncEngine {
             .await
             .get(doc_id)
             .cloned()
-            .unwrap_or_else(|| server_text.to_string());
+            .unwrap_or_else(|| crate::ot::normalise_newlines(server_text));
         if let Some(mut doc) = self.fs.doc(ino) {
             doc.set_text(&text);
             self.fs.set_doc(ino, doc);
@@ -1339,7 +1553,7 @@ impl SyncEngine {
             return Ok(());
         }
 
-        let op = parse_wire_op(op_json, base.chars().count())?;
+        let op = parse_wire_op(op_json, &base)?;
         let new_text = match op.apply(&base) {
             Ok(t) => t,
             Err(e) => {
@@ -1428,32 +1642,39 @@ impl SyncEngine {
                 }
             };
             let Some(local) = self.fs.doc(ino) else { continue };
-            let remote_text = fresh.text();
+            let remote_raw = fresh.text();
+            let remote_text = crate::ot::normalise_newlines(&remote_raw);
             let local_text = local.text();
             if remote_text == local_text {
+                self.synced
+                    .lock()
+                    .await
+                    .insert(u.doc_id.clone(), (remote_raw, fresh.version));
                 self.versions
                     .lock()
                     .await
                     .insert(u.doc_id.clone(), fresh.version);
                 continue;
             }
-            // Optimistic three-way merge: the common ancestor is our cached
-            // copy; a genuine overlap keeps both sides with markers.
-            let merged = merge3::merge3(&remote_text, &local_text, &remote_text);
-            if !merged.conflicts.is_empty() {
-                warn!(
-                    "doc {} has {} conflicting region(s); keeping both sides",
-                    u.doc_id,
-                    merged.conflicts.len()
-                );
-            }
-            let mut doc = fresh.clone();
-            doc.set_text(&merged.text);
-            self.fs.set_doc(ino, doc);
+            // The server text becomes the new OT base, then any local change
+            // that has not been confirmed yet is rebased onto it. Passing the
+            // *remote* text as the merge ancestor (as this used to) makes the
+            // three-way merge return the local side untouched — the polled
+            // update never reached the mounted file.
+            self.synced
+                .lock()
+                .await
+                .insert(u.doc_id.clone(), (remote_raw.clone(), fresh.version));
             self.versions
                 .lock()
                 .await
                 .insert(u.doc_id.clone(), fresh.version);
+            if let Some(mut doc) = self.fs.doc(ino) {
+                doc.version = fresh.version;
+                self.fs.set_doc(ino, doc);
+            }
+            self.settle_local_after_push(&u.doc_id, &remote_raw).await;
+            self.publish_visible(&u.doc_id, &remote_raw).await;
             self.notifier.invalidate(ino);
             info!("polled update for {} -> v{}", u.doc_id, fresh.version);
         }
@@ -1494,13 +1715,46 @@ fn rebase_local(from: &str, want: &str, base: &str) -> String {
     }
 }
 
+/// Length of `s` in UTF-16 code units.
+///
+/// ShareJS/ot.js — and therefore `document-updater` — index documents by
+/// JavaScript string position, i.e. UTF-16 code units. A Rust `char` is a
+/// Unicode scalar value, so an astral character (emoji, some CJK extensions,
+/// musical symbols) is 1 `char` but 2 UTF-16 code units. Positions must be
+/// translated at the wire boundary or every edit after such a character lands
+/// in the wrong place.
+pub fn utf16_len(s: &str) -> usize {
+    s.chars().map(char::len_utf16).sum()
+}
+
+/// Advance over `chars` from `char_pos` by `units` UTF-16 code units.
+/// Returns how many characters that covers; errors if the offset would split a
+/// surrogate pair or run past the end of the document.
+fn advance_units(chars: &[char], char_pos: usize, units: usize) -> Result<usize> {
+    let mut seen = 0usize;
+    let mut i = 0usize;
+    while seen < units {
+        let ch = chars
+            .get(char_pos + i)
+            .ok_or_else(|| anyhow!("operation offset runs past the end of the document"))?;
+        seen += ch.len_utf16();
+        i += 1;
+    }
+    if seen != units {
+        bail!("operation offset {units} falls inside a surrogate pair");
+    }
+    Ok(i)
+}
+
 /// Convert an Overleaf wire operation into a `TextOp`.
 ///
 /// document-updater's `sharejs-text-ot` type takes a **positional** op list:
 /// `[{"p": 12, "i": "hello"}, {"p": 20, "d": "world"}]`, applied in order to the
-/// evolving document. Older payloads (and the history-OT type) use a component
-/// list instead, so both are accepted.
-pub fn parse_wire_op(v: &Value, base_len: usize) -> Result<TextOp> {
+/// evolving document. `p` is a UTF-16 code-unit offset in that evolving
+/// document. Older payloads (and the history-OT type) use a component list
+/// instead, where numbers are also UTF-16 code units, so both are converted
+/// here. `base` is the document the operation applies to.
+pub fn parse_wire_op(v: &Value, base: &str) -> Result<TextOp> {
     let arr = if let Some(a) = v.as_array() {
         a.clone()
     } else if let Some(a) = v.get("op").and_then(|o| o.as_array()) {
@@ -1509,97 +1763,135 @@ pub fn parse_wire_op(v: &Value, base_len: usize) -> Result<TextOp> {
         bail!("unrecognised operation shape: {v}");
     };
 
+    let chars: Vec<char> = base.chars().collect();
+    let base_len = chars.len();
+    // Cursor into the *base* document: characters consumed, and the UTF-16
+    // position reached in the evolving document.
+    let mut base_char = 0usize;
+    let mut base_u16 = 0usize;
+
     // Component form: [3, "inserted", {"d": "abc"}, -2]
     let is_component_form = arr.iter().all(|c| {
-        c.is_i64() || c.get("i").is_some() || c.get("d").is_some()
-    }) && arr
-        .iter()
-        .any(|c| c.is_i64() || c.get("i").is_some() || c.get("d").is_some())
-        && !arr.iter().any(|c| c.get("p").is_some());
+        c.is_i64() || c.is_string() || c.get("i").is_some() || c.get("d").is_some()
+    }) && arr.iter().any(|c| {
+        c.is_i64() || c.is_string() || c.get("i").is_some() || c.get("d").is_some()
+    }) && !arr.iter().any(|c| c.get("p").is_some());
     if is_component_form && !arr.is_empty() {
         let mut op = TextOp::new();
-        for comp in arr {
+        for comp in &arr {
             if let Some(n) = comp.as_i64() {
+                // Positive: retain n code units. Negative: remove n code units.
+                let units = n.unsigned_abs() as usize;
+                let k = advance_units(&chars, base_char, units)?;
                 if n >= 0 {
-                    op.retain(n as usize);
+                    op.retain(k);
                 } else {
-                    op.remove((-n) as usize);
+                    op.remove(k);
                 }
+                base_char += k;
+                base_u16 += units;
                 continue;
             }
-            if let Some(s) = comp.get("i").and_then(|x| x.as_str()) {
-                op.insert(s);
+            // sharejs' canonical component form uses a bare string for inserts:
+            // `[3, "x", -2]`.
+            if let Some(text) = comp.as_str() {
+                op.insert(text);
+                base_u16 += utf16_len(text);
                 continue;
             }
-            if let Some(s) = comp.get("d").and_then(|x| x.as_str()) {
-                op.remove(s.chars().count());
+            if let Some(text) = comp.get("i").and_then(|x| x.as_str()) {
+                op.insert(text);
+                base_u16 += utf16_len(text);
+                continue;
+            }
+            if let Some(text) = comp.get("d").and_then(|x| x.as_str()) {
+                let k = text.chars().count();
+                if base_char + k > base_len {
+                    bail!("component delete runs past the end of the document");
+                }
+                op.remove(k);
+                base_char += k;
                 continue;
             }
             if let Some(n) = comp.get("d").and_then(|x| x.as_i64()) {
-                op.remove(n as usize);
+                let units = n.unsigned_abs() as usize;
+                let k = advance_units(&chars, base_char, units)?;
+                op.remove(k);
+                base_char += k;
+                base_u16 += units;
                 continue;
             }
             bail!("unrecognised operation component: {comp}");
         }
-        if op.base_len < base_len {
-            op.retain(base_len - op.base_len);
+        if base_char < base_len {
+            op.retain(base_len - base_char);
         }
         return Ok(op);
     }
 
     // Positional form: each entry edits the document produced so far.
     let mut op = TextOp::new();
-    let mut cursor = 0usize; // position reached in the evolving document
-    for entry in arr {
+    for entry in &arr {
         let p = entry
             .get("p")
             .and_then(|x| x.as_u64())
             .ok_or_else(|| anyhow!("positional op without p: {entry}"))?
             as usize;
-        if p < cursor {
-            bail!("overlapping positional ops at p={p} (cursor {cursor})");
+        if p < base_u16 {
+            bail!("overlapping positional ops at p={p} (cursor {base_u16})");
         }
-        op.retain(p - cursor);
-        if let Some(s) = entry.get("i").and_then(|x| x.as_str()) {
-            op.insert(s);
-            cursor = p + s.chars().count();
-        } else if let Some(s) = entry.get("d").and_then(|x| x.as_str()) {
-            op.remove(s.chars().count());
-            cursor = p;
+        let k = advance_units(&chars, base_char, p - base_u16)?;
+        op.retain(k);
+        base_char += k;
+        base_u16 = p;
+        if let Some(text) = entry.get("i").and_then(|x| x.as_str()) {
+            op.insert(text);
+            base_u16 += utf16_len(text);
+        } else if let Some(text) = entry.get("d").and_then(|x| x.as_str()) {
+            let k = text.chars().count();
+            if base_char + k > base_len {
+                bail!("positional delete runs past the end of the document");
+            }
+            op.remove(k);
+            base_char += k;
         } else {
             bail!("positional op without i/d: {entry}");
         }
     }
     // Text after the last op is kept: sharejs ops omit the trailing retain.
-    if op.base_len < base_len {
-        op.retain(base_len - op.base_len);
+    if base_char < base_len {
+        op.retain(base_len - base_char);
     }
     Ok(op)
 }
 
-/// Convert a `TextOp` into the positional wire form, using the current document
-/// text to fill in the deleted characters (`document-updater` validates them).
+/// Convert a `TextOp` into the positional wire form, using the base document to
+/// fill in the deleted characters (`document-updater` validates them) and
+/// translating character positions into UTF-16 code units.
 pub fn to_wire_op(op: &TextOp, base: &str) -> Value {
     let chars: Vec<char> = base.chars().collect();
     let mut out = Vec::new();
-    let mut pos = 0usize; // position in the doc as it evolves
-    let mut base_pos = 0usize; // position in the original doc
+    let mut pos_u16 = 0usize; // position in the document as it evolves
+    let mut base_char = 0usize; // position in the original document
     for c in &op.components {
         match c {
             crate::ot::Component::Retain(n) => {
-                pos += n;
-                base_pos += n;
+                let end = (base_char + n).min(chars.len());
+                for ch in &chars[base_char..end] {
+                    pos_u16 += ch.len_utf16();
+                }
+                base_char = end;
             }
             crate::ot::Component::Insert(s) => {
-                out.push(json!({ "p": pos, "i": s }));
-                pos += s.chars().count();
+                out.push(json!({ "p": pos_u16, "i": s }));
+                pos_u16 += utf16_len(s);
             }
             crate::ot::Component::Remove(n) => {
-                let end = (base_pos + n).min(chars.len());
-                let deleted: String = chars[base_pos.min(chars.len())..end].iter().collect();
-                out.push(json!({ "p": pos, "d": deleted }));
-                base_pos += n;
-                // `pos` stays: the following text shifts into this position
+                let end = (base_char + n).min(chars.len());
+                let deleted: String = chars[base_char..end].iter().collect();
+                out.push(json!({ "p": pos_u16, "d": deleted }));
+                base_char = end;
+                // `pos_u16` stays: the following text shifts into this position.
             }
         }
     }
@@ -1637,7 +1929,7 @@ mod tests {
         assert_eq!(op.apply("abcde").unwrap(), "abchi");
         let wire = to_wire_op(&op, "abcde");
         assert_eq!(wire, json!([{ "p": 3, "i": "hi" }, { "p": 5, "d": "de" }]));
-        let back = parse_wire_op(&wire, 5).unwrap();
+        let back = parse_wire_op(&wire, "abcde").unwrap();
         assert_eq!(back.apply("abcde").unwrap(), "abchi");
         assert_eq!(back, op, "wire roundtrip must preserve the operation");
     }
@@ -1653,7 +1945,7 @@ mod tests {
         let base = "abcdef";
         let wire = to_wire_op(&op, base);
         assert_eq!(wire, json!([{ "p": 2, "i": "XY" }, { "p": 4, "d": "cde" }]));
-        let back = parse_wire_op(&wire, base.len()).unwrap();
+        let back = parse_wire_op(&wire, base).unwrap();
         assert_eq!(back.apply(base).unwrap(), op.apply(base).unwrap());
         assert_eq!(back.apply(base).unwrap(), "abXYf");
     }
@@ -1661,15 +1953,84 @@ mod tests {
     #[test]
     fn wire_parses_component_form_and_negative_delete() {
         let v = json!([2, -1, 1]);
-        let op = parse_wire_op(&v, 4).unwrap();
+        let op = parse_wire_op(&v, "abcd").unwrap();
         assert_eq!(op.apply("abcd").unwrap(), "abd");
+    }
+
+    #[test]
+    fn wire_positions_use_utf16_code_units() {
+        // "a😀b": the emoji is one char but two UTF-16 code units.
+        let base = "a😀b";
+        let mut op = TextOp::new();
+        op.retain(2); // 'a' + emoji
+        op.insert("X");
+        op.retain(1);
+        assert_eq!(op.apply(base).unwrap(), "a😀Xb");
+        let wire = to_wire_op(&op, base);
+        assert_eq!(
+            wire,
+            json!([{ "p": 3, "i": "X" }]),
+            "p must count UTF-16 units, not chars"
+        );
+        let back = parse_wire_op(&wire, base).unwrap();
+        assert_eq!(back.apply(base).unwrap(), "a😀Xb");
+        assert_eq!(back.change_size(), (1, 0));
+    }
+
+    #[test]
+    fn wire_delete_of_astral_character_roundtrips() {
+        let base = "a😀b";
+        let mut op = TextOp::new();
+        op.retain(1);
+        op.remove(1); // the emoji
+        op.retain(1);
+        assert_eq!(op.apply(base).unwrap(), "ab");
+        let wire = to_wire_op(&op, base);
+        assert_eq!(wire, json!([{ "p": 1, "d": "😀" }]));
+        let back = parse_wire_op(&wire, base).unwrap();
+        assert_eq!(back.apply(base).unwrap(), "ab");
+    }
+
+    #[test]
+    fn wire_inserted_astral_text_advances_by_two_units() {
+        let base = "ab";
+        let mut op = TextOp::new();
+        op.retain(1);
+        op.insert("😀");
+        op.retain(1);
+        let wire = to_wire_op(&op, base);
+        assert_eq!(wire, json!([{ "p": 1, "i": "😀" }]));
+        // Unit 3 is immediately after the emoji (a=1 unit, emoji=2 units).
+        let wire_after = json!([{ "p": 3, "i": "!" }]);
+        let parsed = parse_wire_op(&wire_after, "a😀b").unwrap();
+        assert_eq!(parsed.apply("a😀b").unwrap(), "a😀!b");
+    }
+
+    #[test]
+    fn wire_rejects_offsets_inside_a_surrogate_pair() {
+        let v = json!([{ "p": 2, "i": "X" }]);
+        assert!(parse_wire_op(&v, "a😀b").is_err());
+    }
+
+    #[test]
+    fn wire_parses_component_form_with_bare_insert_string() {
+        // sharejs' canonical component form: [retain, "insert", -remove]
+        let op = parse_wire_op(&json!([3, "x", -2]), "abcde").unwrap();
+        assert_eq!(op.apply("abcde").unwrap(), "abcx");
+    }
+
+    #[test]
+    fn wire_component_form_counts_utf16_units() {
+        let op = parse_wire_op(&json!([3, "!", -1]), "a😀b").unwrap();
+        // Unit 3 is after the emoji; the delete removes "b".
+        assert_eq!(op.apply("a😀b").unwrap(), "a😀!");
     }
 
     #[test]
     fn wire_parses_positional_from_server() {
         // insert "# " at 0, then delete one char at evolving position 5 (= 'd')
         let v = json!([{ "p": 0, "i": "# " }, { "p": 5, "d": "d" }]);
-        let op = parse_wire_op(&v, 6).unwrap();
+        let op = parse_wire_op(&v, "abcdef").unwrap();
         assert_eq!(op.apply("abcdef").unwrap(), "# abcef");
     }
 }
