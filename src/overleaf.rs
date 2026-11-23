@@ -682,9 +682,21 @@ impl OverleafClient {
     }
 
     /// Create a text document in the root folder.
-    pub async fn add_doc(&self, name: &str, lines: &[String]) -> Result<String> {
+    pub async fn add_doc(
+        &self,
+        name: &str,
+        lines: &[String],
+        parent_folder_id: Option<&str>,
+    ) -> Result<String> {
         let url = self.url(&format!("/project/{}/doc", self.project_id));
-        let body = json!({ "name": name, "lines": lines, "parent_folder_id": "rootFolder" });
+        // `parent_folder_id: null` makes web use the project root folder; it is
+        // *not* the literal string "rootFolder" (that is not a folder id, and
+        // the handler answers 404 when it cannot find it).
+        let body = json!({
+            "name": name,
+            "lines": lines,
+            "parent_folder_id": parent_folder_id,
+        });
         let res = self
             .send_with_auth(reqwest::Method::POST, url, Some(body))
             .await?;
@@ -697,10 +709,10 @@ impl OverleafClient {
         doc_id_from_add_response(&v).ok_or_else(|| anyhow!("add_doc: no _id in response: {}", truncate(&text, 200)))
     }
 
-    /// Create a folder (or a text doc) at the project root.
-    pub async fn add_folder(&self, name: &str) -> Result<String> {
+    /// Create a folder (or a text doc) in `parent_folder_id` (`None` = root).
+    pub async fn add_folder(&self, name: &str, parent_folder_id: Option<&str>) -> Result<String> {
         let url = self.url(&format!("/project/{}/folder", self.project_id));
-        let body = json!({ "name": name, "parent_folder_id": "rootFolder" });
+        let body = json!({ "name": name, "parent_folder_id": parent_folder_id });
         let res = self
             .send_with_auth(reqwest::Method::POST, url, Some(body))
             .await?;

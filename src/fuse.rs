@@ -437,8 +437,22 @@ impl Filesystem for OverleafFs {
         let Some(ino) = self.fs.lookup(parent, name) else {
             return reply.error(libc::ENOENT);
         };
+        // `renameat2(RENAME_NOREPLACE)` must fail if the destination exists.
+        if _flags & libc::RENAME_NOREPLACE as u32 != 0
+            && self.fs.lookup(newparent, newname).is_some()
+        {
+            return reply.error(libc::EEXIST);
+        }
         match self.fs.r#move(ino, newparent, newname) {
-            Ok(_) => {
+            Ok((ino, removed_docs)) => {
+                // rename(2) may replace an existing entry; anything it pushed
+                // out must be deleted on the server too, or it lingers there.
+                for doc_id in removed_docs {
+                    self.sync.send(Outgoing::Delete {
+                        ino,
+                        doc_id: Some(doc_id),
+                    });
+                }
                 self.sync.send(Outgoing::Rename {
                     ino,
                     new_parent: newparent,

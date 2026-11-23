@@ -387,16 +387,50 @@ impl Fs {
     }
 
     /// Move/rename `ino` to `new_parent`/`new_name`.
-    pub fn r#move(&self, ino: u64, new_parent: u64, new_name: &str) -> Result<u64, i32> {
-        if self.lookup(new_parent, new_name).is_some() {
-            return Err(libc::EEXIST);
-        }
+    /// Move/rename a node, with POSIX `rename(2)` semantics: an existing
+    /// destination is replaced (that is how git and most editors commit lock
+    /// files, e.g. `.git/config.lock` -> `.git/config`).
+    ///
+    /// Returns the inode and the document ids that the replacement removed, so
+    /// the caller can delete them on the server.
+    pub fn r#move(&self, ino: u64, new_parent: u64, new_name: &str) -> Result<(u64, Vec<String>), i32> {
         let (old_parent, old_name) = match self.nodes.read().get(&ino) {
             Some(n) => (n.parent, n.name.clone()),
             None => return Err(libc::ENOENT),
         };
-        if old_parent == new_parent && old_name == new_name {
-            return Ok(ino);
+        let src_is_dir = match self.nodes.read().get(&ino) {
+            Some(n) => n.is_dir(),
+            None => return Err(libc::ENOENT),
+        };
+        let mut removed_docs = Vec::new();
+        if let Some(dest) = self.lookup(new_parent, new_name) {
+            if dest == ino {
+                return Ok((ino, removed_docs));
+            }
+            let dest_is_dir = match self.nodes.read().get(&dest) {
+                Some(n) => n.is_dir(),
+                None => return Err(libc::ENOENT),
+            };
+            match (src_is_dir, dest_is_dir) {
+                // A file cannot replace a directory and vice versa.
+                (false, true) => return Err(libc::EISDIR),
+                (true, false) => return Err(libc::ENOTDIR),
+                (true, true) => {
+                    let non_empty = self
+                        .children
+                        .read()
+                        .get(&dest)
+                        .map(|kids| !kids.is_empty())
+                        .unwrap_or(false);
+                    if non_empty {
+                        return Err(libc::ENOTEMPTY);
+                    }
+                }
+                (false, false) => {}
+            }
+            removed_docs = self.remove(dest);
+        } else if old_parent == new_parent && old_name == new_name {
+            return Ok((ino, removed_docs));
         }
         // forbid moving a directory inside itself
         let mut cur = new_parent;
@@ -430,7 +464,7 @@ impl Fs {
             }
         }
         self.bump();
-        Ok(ino)
+        Ok((ino, removed_docs))
     }
 
     /// Read the full text content of a doc/local node.
@@ -594,6 +628,55 @@ mod tests {
         assert_eq!(ino2, ino);
         let n = fs.node(ino).unwrap();
         assert_eq!(perm_bits(n.attrs.mode), 0o600);
+    }
+
+    #[test]
+    fn rename_replaces_the_destination() {
+        // POSIX rename(2) replaces an existing target. git relies on it:
+        // it writes `.git/config.lock` and renames it over `.git/config`.
+        let fs = Fs::new(0, 0, Duration::from_secs(1));
+        let old = fs.upsert(
+            ROOT_INO,
+            "config",
+            NodeKind::Doc { doc_id: "old".into(), ranges: None },
+            0,
+        );
+        fs.doc_inodes.write().insert("old".into(), old);
+        let lock = fs.upsert(
+            ROOT_INO,
+            "config.lock",
+            NodeKind::Doc { doc_id: "pending:config.lock".into(), ranges: None },
+            0,
+        );
+        let (ino, removed) = fs.r#move(lock, ROOT_INO, "config").unwrap();
+        assert_eq!(ino, lock);
+        assert_eq!(removed, vec!["old".to_string()]);
+        assert_eq!(fs.lookup(ROOT_INO, "config"), Some(lock));
+        assert_eq!(fs.lookup(ROOT_INO, "config.lock"), None);
+        assert!(fs.node(old).is_none());
+    }
+
+    #[test]
+    fn rename_refuses_incompatible_destinations() {
+        let fs = Fs::new(0, 0, Duration::from_secs(1));
+        let a = fs.upsert(ROOT_INO, "a", NodeKind::Dir, 0);
+        let b = fs.upsert(ROOT_INO, "b", NodeKind::Dir, 0);
+        fs.upsert(b, "keep", NodeKind::LocalFile, 0);
+        assert_eq!(fs.r#move(a, ROOT_INO, "b").unwrap_err(), libc::ENOTEMPTY);
+        let f = fs.upsert(ROOT_INO, "f", NodeKind::LocalFile, 0);
+        assert_eq!(fs.r#move(f, ROOT_INO, "b").unwrap_err(), libc::EISDIR);
+        let d = fs.upsert(ROOT_INO, "d", NodeKind::Dir, 0);
+        assert_eq!(fs.r#move(d, ROOT_INO, "f").unwrap_err(), libc::ENOTDIR);
+    }
+
+    #[test]
+    fn dot_git_is_always_local() {
+        use crate::gitignore::Ignorer;
+        let ig = Ignorer::with_root_rules("/.git\n");
+        assert!(ig.is_ignored(".git"));
+        assert!(ig.is_ignored(".git/config"));
+        assert!(ig.is_ignored(".git/objects/ab/cdef"));
+        assert!(!ig.is_ignored("git/config"));
     }
 
     #[test]

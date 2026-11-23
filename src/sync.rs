@@ -183,6 +183,10 @@ pub struct SyncEngine {
     unknown_content: Mutex<std::collections::HashSet<String>>,
     /// Number of documents whose initial `joinDoc` snapshot is still outstanding.
     pending_docs: Mutex<usize>,
+    /// Inode -> server folder id for directories (needed as
+    /// `parent_folder_id` when creating something inside them). Kept under a
+    /// std mutex because the tree walker is synchronous.
+    folder_ids: std::sync::Mutex<HashMap<u64, String>>,
     /// Signalled once every initial document snapshot has arrived.
     contents_ready: tokio::sync::Notify,
     ack_counter: std::sync::atomic::AtomicU64,
@@ -220,6 +224,7 @@ impl SyncEngine {
             ready: tokio::sync::Notify::new(),
             unknown_content: Mutex::new(std::collections::HashSet::new()),
             pending_docs: Mutex::new(0),
+            folder_ids: std::sync::Mutex::new(HashMap::new()),
             contents_ready: tokio::sync::Notify::new(),
             ack_counter: std::sync::atomic::AtomicU64::new(1),
             socket_up: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -332,7 +337,13 @@ impl SyncEngine {
         let mut folders = meta.folders.clone();
         folders.sort_by_key(|f| f.path.matches('/').count());
         for f in &folders {
-            self.ensure_dir(&f.path);
+            let ino = self.ensure_dir(&f.path);
+            if !f.id.is_empty() {
+                self.folder_ids
+                    .lock()
+                    .unwrap()
+                    .insert(ino, f.id.clone());
+            }
         }
         for d in &meta.docs {
             let (parent, name) = match d.path.rsplit_once('/') {
@@ -740,7 +751,10 @@ impl SyncEngine {
             // local-only file: nothing to do
             return Ok(());
         } else {
-            self.client.add_doc(name, &initial).await?
+            let parent_folder_id = self.folder_id_for(parent);
+            self.client
+                .add_doc(name, &initial, parent_folder_id.as_deref())
+                .await?
         };
         let ino = self.fs.upsert(
             parent,
@@ -815,9 +829,32 @@ impl SyncEngine {
         if self.fs.is_ignored(&path) {
             return Ok(());
         }
-        self.client.add_folder(name).await?;
+        let parent_folder_id = self.folder_id_for(parent);
+        let folder_id = self
+            .client
+            .add_folder(name, parent_folder_id.as_deref())
+            .await?;
+        if let Some(ino) = self.fs.lookup(parent, name) {
+            self.folder_ids
+                .lock()
+                .unwrap()
+                .insert(ino, folder_id);
+        }
         self.notifier.tree_changed();
         Ok(())
+    }
+
+    /// Server folder id for `ino`. `None` means "the project root": the web API
+    /// substitutes the real root folder id when `parent_folder_id` is null.
+    fn folder_id_for(&self, ino: u64) -> Option<String> {
+        if ino == ROOT_INO {
+            return None;
+        }
+        let id = self.folder_ids.lock().unwrap().get(&ino).cloned();
+        if id.is_none() {
+            debug!("folder inode {ino}: server folder id unknown; creating at the project root");
+        }
+        id
     }
 
     async fn rename(&self, ino: u64, new_parent: u64, new_name: &str) -> Result<()> {
@@ -1164,6 +1201,9 @@ impl SyncEngine {
                     continue;
                 };
                 let ino = self.fs.upsert(parent, fname, NodeKind::Dir, 0);
+                if let Some(id) = f.get("_id").and_then(|x| x.as_str()) {
+                    self.folder_ids.lock().unwrap().insert(ino, id.to_string());
+                }
                 self.walk_folder(f, ino, out);
             }
         }
