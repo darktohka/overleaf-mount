@@ -67,12 +67,16 @@ Ctrl+C or `SIGTERM` unmounts cleanly, and the mount is created with
   they live in the mount's memory, so `*.aux`, `*.log`, `build/` behave normally
   for `latexmk` without polluting the project. Nested `.gitignore` files and
   `!re-include` rules work, and an ancestor match (`build/`) covers children.
-  `/.git` is always local-only, so `git init`/`commit` in the mount never push
-  repository internals into the project.
-* **Binary uploads** are read-only (`EROFS` on write): Overleaf's OT types have no
-  notion of a blob edit. Their content is not streamed with the tree, so the
-  first `stat` learns the size with a `HEAD` and the first `read` downloads the
-  bytes; both are cached in memory for the life of the mount.
+* **Every file is mirrored — nothing else is special-cased.** That includes a
+  `.git` directory: `git init`/`add`/`commit` work in the mount and the whole
+  repository is synchronised to the project (text files as documents, binary
+  objects as uploaded files).
+* **Binary files** are stored as Overleaf uploads (`fileRef`), which have no OT
+  type: a write replaces the whole file. A new file whose name does not identify
+  it as text is classified on its first flush — valid UTF-8 without NUL bytes
+  becomes a document, anything else an upload. Their content is not streamed
+  with the tree, so the first `stat` learns the size with a `HEAD` and the first
+  `read` downloads the bytes; both are cached in memory.
 
 ## Text encoding and line endings
 

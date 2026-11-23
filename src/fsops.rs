@@ -125,11 +125,11 @@ pub fn looks_like_text(name: &str) -> bool {
         "less", "xml", "svg", "gitignore", "gitattributes", "editorconfig", "env", "makefile",
         "mk", "dockerfile", "lp", "sage", "asy", "pgf", "tikz",
     ];
-    if TEXT_EXT.iter().any(|e| lower.ends_with(&format!(".{e}"))) {
-        return true;
-    }
-    // bare names without an extension are usually project docs (e.g. Makefile)
-    !lower.contains('.')
+    // Only *known* text extensions take the optimistic document path. Names
+    // without an extension need their content to decide (a Makefile is text,
+    // `.git/index` or a loose git object is not), so they are classified on
+    // their first flush instead.
+    TEXT_EXT.iter().any(|e| lower.ends_with(&format!(".{e}")))
 }
 
 /// Format a `NodeKind` for logs.

@@ -725,14 +725,27 @@ impl OverleafClient {
         doc_id_from_add_response(&v).ok_or_else(|| anyhow!("add_folder: no _id in response"))
     }
 
-    /// Upload a binary file (document store) to the root folder.
-    pub async fn upload_file(&self, name: &str, bytes: Vec<u8>) -> Result<String> {
-        let url = self.url(&format!("/project/{}/upload", self.project_id));
+    /// Upload a binary file into `parent_folder_id` (`None` = project root).
+    ///
+    /// The web route is `POST /Project/:id/upload?folder_id=…` with multipart
+    /// fields `name` and `qqfile`. Uploading a name that already exists in the
+    /// folder replaces its content (`FileSystemImportManager` uses
+    /// `upsertFile`), which is what makes binary files writable on the mount.
+    pub async fn upload_file(
+        &self,
+        name: &str,
+        bytes: Vec<u8>,
+        parent_folder_id: Option<&str>,
+    ) -> Result<String> {
+        let mut url = self.url(&format!("/Project/{}/upload", self.project_id));
+        if let Some(id) = parent_folder_id {
+            url.query_pairs_mut().append_pair("folder_id", id);
+        }
         let part = reqwest::multipart::Part::bytes(bytes)
             .file_name(name.to_string())
             .mime_str("application/octet-stream")?;
         let form = reqwest::multipart::Form::new()
-            .text("parent_folder_id", "rootFolder")
+            .text("name", name.to_string())
             .part("qqfile", part);
         let mut req = self.http.post(url);
         if let Some(c) = self.cookies_header() {
@@ -749,11 +762,16 @@ impl OverleafClient {
             bail!("upload {name} -> {status}: {}", truncate(&text, 300));
         }
         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        Ok(v.get("entity_id")
+        let id = v
+            .get("entity_id")
             .or_else(|| v.get("_id"))
             .and_then(|x| x.as_str())
             .unwrap_or_default()
-            .to_string())
+            .to_string();
+        if id.is_empty() {
+            bail!("upload {name}: no entity_id in response: {}", truncate(&text, 200));
+        }
+        Ok(id)
     }
 
     /// List uploaded files (`GET /project/:id/files`).
@@ -816,10 +834,58 @@ impl OverleafClient {
             .ok_or_else(|| anyhow!("get_file_size {file_id}: no content-length"))
     }
 
-    /// Rename / move any entity.
+    /// Rename an entity (`POST /project/:id/:type/:id/rename`).
     pub async fn rename_entity(&self, entity_id: &str, entity_type: Entity, new_name: &str) -> Result<()> {
-        let url = self.url(&format!("/project/{}/{}", self.project_id, entity_type));
-        let body = json!({ "name": new_name });
+        let url = self.url(&format!(
+            "/project/{}/{}/{}/rename",
+            self.project_id, entity_type, entity_id
+        ));
+        self.entity_post(url, json!({ "name": new_name }), "rename", entity_type, entity_id)
+            .await
+    }
+
+    /// Move an entity into `folder_id` (`None` = project root).
+    pub async fn move_entity(
+        &self,
+        entity_id: &str,
+        entity_type: Entity,
+        folder_id: Option<&str>,
+    ) -> Result<()> {
+        let url = self.url(&format!(
+            "/project/{}/{}/{}/move",
+            self.project_id, entity_type, entity_id
+        ));
+        let body = match folder_id {
+            Some(id) => json!({ "folder_id": id }),
+            None => json!({}),
+        };
+        self.entity_post(url, body, "move", entity_type, entity_id)
+            .await
+    }
+
+    /// Delete a doc, file or folder.
+    pub async fn delete_entity(&self, entity_id: &str, entity_type: Entity) -> Result<()> {
+        let url = self.url(&format!(
+            "/project/{}/{}/{}",
+            self.project_id, entity_type, entity_id
+        ));
+        let res = self
+            .send_with_auth(reqwest::Method::DELETE, url, None)
+            .await?;
+        if !res.status().is_success() {
+            bail!("delete {entity_type} {entity_id} -> {}", res.status());
+        }
+        Ok(())
+    }
+
+    async fn entity_post(
+        &self,
+        url: Url,
+        body: Value,
+        action: &str,
+        entity_type: Entity,
+        entity_id: &str,
+    ) -> Result<()> {
         let mut req = self.http.request(reqwest::Method::POST, url);
         if let Some(c) = self.cookies_header() {
             req = req.header(COOKIE, c);
@@ -830,7 +896,12 @@ impl OverleafClient {
         let res = req.json(&body).send().await?;
         self.absorb_cookies(&res);
         if !res.status().is_success() {
-            bail!("rename {entity_type} {entity_id} -> {}", res.status());
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            bail!(
+                "{action} {entity_type} {entity_id} -> {status}: {}",
+                truncate(&text, 200)
+            );
         }
         Ok(())
     }

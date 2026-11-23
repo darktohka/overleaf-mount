@@ -70,8 +70,27 @@ pub enum Outgoing {
     /// The user created a new text file.
     CreateDoc { parent: u64, name: String, text: String },
     CreateDir { parent: u64, name: String },
-    Rename { ino: u64, new_parent: u64, new_name: String },
-    Delete { ino: u64, doc_id: Option<String> },
+    /// The user wrote to an uploaded file (or to a new file whose content is
+    /// not text). Overleaf has no OT type for blobs, so the server copy is
+    /// replaced wholesale.
+    ///
+    /// The parent and name are captured when the flush happens, *not* when the
+    /// intent is processed: git closes a lock file and then renames it, and the
+    /// entity must be created under the name the local client used, so the
+    /// queued rename still has something to rename.
+    WriteFile { ino: u64, parent: u64, name: String },
+    Rename {
+        ino: u64,
+        old_parent: u64,
+        new_parent: u64,
+        new_name: String,
+    },
+    Delete {
+        ino: u64,
+        doc_id: Option<String>,
+        file_id: Option<String>,
+        folder_id: Option<String>,
+    },
 }
 
 /// What we are waiting for when an acknowledgement frame arrives.
@@ -96,6 +115,54 @@ fn chrono_millis() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
+}
+
+/// True when an error is Overleaf's rate limiter (HTTP 429).
+fn is_rate_limited(e: &anyhow::Error) -> bool {
+    e.to_string().contains("429")
+}
+
+/// Overleaf rate-limits entity creation (60 folders/min, 30 docs/min) and the
+/// rename endpoint rejects a name that still exists because the delete of the
+/// replaced entity has not landed yet. Both are transient: retry with backoff
+/// instead of dropping the intent.
+async fn retry_transient<F, Fut, T>(what: &str, mut f: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut delay = Duration::from_millis(300);
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let transient = is_rate_limited(&e)
+                    || e.to_string().contains("already exists")
+                    || e.to_string().contains("folder_not_found");
+                if !transient || attempt >= 10 {
+                    return Err(e);
+                }
+                debug!(
+                    "{what}: transient error ({e:#}); retrying in {} ms",
+                    delay.as_millis()
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
+}
+
+/// Content that can round-trip through an Overleaf document: valid UTF-8 and
+/// no NUL bytes. Everything else has to be a fileRef.
+fn text_content(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    if text.contains('\0') {
+        return None;
+    }
+    Some(text.to_string())
 }
 
 /// Push a frame into the live socket, if any.
@@ -183,10 +250,10 @@ pub struct SyncEngine {
     unknown_content: Mutex<std::collections::HashSet<String>>,
     /// Number of documents whose initial `joinDoc` snapshot is still outstanding.
     pending_docs: Mutex<usize>,
-    /// Inode -> server folder id for directories (needed as
-    /// `parent_folder_id` when creating something inside them). Kept under a
-    /// std mutex because the tree walker is synchronous.
-    folder_ids: std::sync::Mutex<HashMap<u64, String>>,
+    /// Per-document `joinDoc` acknowledgements. Real-time authorizes the socket
+    /// for a document only when it is joined, and a freshly created document
+    /// must be joined before `applyOtUpdate` is accepted.
+    joined: Mutex<HashMap<String, tokio::sync::watch::Sender<u64>>>,
     /// Signalled once every initial document snapshot has arrived.
     contents_ready: tokio::sync::Notify,
     ack_counter: std::sync::atomic::AtomicU64,
@@ -224,7 +291,7 @@ impl SyncEngine {
             ready: tokio::sync::Notify::new(),
             unknown_content: Mutex::new(std::collections::HashSet::new()),
             pending_docs: Mutex::new(0),
-            folder_ids: std::sync::Mutex::new(HashMap::new()),
+            joined: Mutex::new(HashMap::new()),
             contents_ready: tokio::sync::Notify::new(),
             ack_counter: std::sync::atomic::AtomicU64::new(1),
             socket_up: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -339,10 +406,7 @@ impl SyncEngine {
         for f in &folders {
             let ino = self.ensure_dir(&f.path);
             if !f.id.is_empty() {
-                self.folder_ids
-                    .lock()
-                    .unwrap()
-                    .insert(ino, f.id.clone());
+                self.fs.set_folder_id(ino, f.id.clone());
             }
         }
         for d in &meta.docs {
@@ -438,12 +502,21 @@ impl SyncEngine {
                     text,
                 } => self.create_doc(parent, &name, &text).await,
                 Outgoing::CreateDir { parent, name } => self.create_dir(parent, &name).await,
+                Outgoing::WriteFile { ino, parent, name } => {
+                    self.clone().write_file(ino, parent, &name).await
+                }
                 Outgoing::Rename {
                     ino,
+                    old_parent,
                     new_parent,
                     new_name,
-                } => self.rename(ino, new_parent, &new_name).await,
-                Outgoing::Delete { ino, doc_id } => self.delete(ino, doc_id).await,
+                } => self.rename(ino, old_parent, new_parent, &new_name).await,
+                Outgoing::Delete {
+                    ino,
+                    doc_id,
+                    file_id,
+                    folder_id,
+                } => self.delete(ino, doc_id, file_id, folder_id).await,
             };
             if let Err(e) = res {
                 warn!("sync error: {e:#}");
@@ -508,6 +581,22 @@ impl SyncEngine {
             }
             self.pumping.lock().await.remove(&doc_id);
         });
+    }
+
+    /// Sender/receiver pair for a document's `joinDoc` acknowledgement.
+    async fn join_channel(&self, doc_id: &str) -> tokio::sync::watch::Receiver<u64> {
+        let mut map = self.joined.lock().await;
+        let tx = map
+            .entry(doc_id.to_string())
+            .or_insert_with(|| tokio::sync::watch::channel(0u64).0);
+        tx.subscribe()
+    }
+
+    async fn bump_joined(&self, doc_id: &str) {
+        let mut map = self.joined.lock().await;
+        if let Some(tx) = map.get(doc_id) {
+            tx.send_modify(|v| *v = v.wrapping_add(1));
+        }
     }
 
     /// Sender/receiver pair for a document's confirmation counter.
@@ -746,24 +835,44 @@ impl SyncEngine {
     }
 
     async fn create_doc(self: &Arc<Self>, parent: u64, name: &str, text: &str) -> Result<()> {
+        let ino = match self.fs.lookup(parent, name) {
+            Some(ino) => ino,
+            None => self.fs.upsert(parent, name, NodeKind::LocalFile, 0),
+        };
+        self.create_doc_at(ino, parent, name, text).await
+    }
+
+    /// Create the server document for an existing inode.
+    ///
+    /// Takes the inode rather than looking the name up: by the time the intent
+    /// is processed the local client may already have renamed the file (git
+    /// writes `HEAD.lock` and renames it to `HEAD`), and re-upserting by the
+    /// captured name would add a phantom node to the tree.
+    async fn create_doc_at(
+        self: &Arc<Self>,
+        ino: u64,
+        parent: u64,
+        name: &str,
+        text: &str,
+    ) -> Result<()> {
         let initial: Vec<String> = crate::ot::split_lines(text);
         let doc_id = if self.fs.is_ignored(&self.fs.path_of(parent)) {
             // local-only file: nothing to do
             return Ok(());
         } else {
-            let parent_folder_id = self.folder_id_for(parent);
-            self.client
-                .add_doc(name, &initial, parent_folder_id.as_deref())
-                .await?
+            let parent_folder_id = self.parent_folder_id(parent)?;
+            retry_transient("add_doc", || {
+                self.client
+                    .add_doc(name, &initial, parent_folder_id.as_deref())
+            })
+            .await?
         };
-        let ino = self.fs.upsert(
-            parent,
-            name,
+        self.fs.set_kind(
+            ino,
             NodeKind::Doc {
                 doc_id: doc_id.clone(),
                 ranges: None,
             },
-            0,
         );
 
         // `create(2)` is immediately followed by `write(2)`; those writes land on
@@ -793,10 +902,13 @@ impl SyncEngine {
                 ranges: None,
             },
         );
+        // `POST /project/:id/doc` creates an *empty* document (web passes `[]`
+        // as the lines), so the OT base is empty even when we already know the
+        // content that will be pushed next.
         self.synced
             .lock()
             .await
-            .insert(doc_id.clone(), (text.to_string(), 0));
+            .insert(doc_id.clone(), (String::new(), 0));
         self.versions.lock().await.insert(doc_id.clone(), 0);
         if !content.is_empty() {
             self.desired
@@ -806,11 +918,30 @@ impl SyncEngine {
             self.desired_from
                 .lock()
                 .await
-                .insert(doc_id.clone(), text.to_string());
+                .insert(doc_id.clone(), String::new());
         }
         self.fs.doc_inodes.write().insert(doc_id.clone(), ino);
         self.notifier.tree_changed();
         if !content.is_empty() {
+            // Real-time only authorizes `applyOtUpdate` for documents this
+            // socket has joined (`ol_context["doc:<id>"]`). A freshly created
+            // document has not been joined, so without this the push is
+            // rejected with "not authorized" and the pump retries blindly —
+            // which used to duplicate the content in the document.
+            let mut joined = self.join_channel(&doc_id).await;
+            let generation = *joined.borrow();
+            self.request_join_doc(&doc_id).await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if joined.changed().await.is_err() {
+                        return;
+                    }
+                    if *joined.borrow() > generation {
+                        return;
+                    }
+                }
+            })
+            .await;
             self.clone().request_write(ino, content, 0).await;
         }
         debug!("created document {doc_id}");
@@ -829,16 +960,14 @@ impl SyncEngine {
         if self.fs.is_ignored(&path) {
             return Ok(());
         }
-        let parent_folder_id = self.folder_id_for(parent);
-        let folder_id = self
-            .client
-            .add_folder(name, parent_folder_id.as_deref())
-            .await?;
+        let parent_folder_id = self.parent_folder_id(parent)?;
+        let folder_id = retry_transient("add_folder", || {
+            self.client
+                .add_folder(name, parent_folder_id.as_deref())
+        })
+        .await?;
         if let Some(ino) = self.fs.lookup(parent, name) {
-            self.folder_ids
-                .lock()
-                .unwrap()
-                .insert(ino, folder_id);
+            self.fs.set_folder_id(ino, folder_id);
         }
         self.notifier.tree_changed();
         Ok(())
@@ -847,61 +976,135 @@ impl SyncEngine {
     /// Server folder id for `ino`. `None` means "the project root": the web API
     /// substitutes the real root folder id when `parent_folder_id` is null.
     fn folder_id_for(&self, ino: u64) -> Option<String> {
-        if ino == ROOT_INO {
-            return None;
-        }
-        let id = self.folder_ids.lock().unwrap().get(&ino).cloned();
-        if id.is_none() {
-            debug!("folder inode {ino}: server folder id unknown; creating at the project root");
-        }
-        id
+        self.fs.folder_id(ino)
     }
 
-    async fn rename(&self, ino: u64, new_parent: u64, new_name: &str) -> Result<()> {
-        let node = match self.fs.node(ino) {
-            Some(n) => n,
-            None => return Ok(()),
-        };
-        if node.is_dir() {
-            // Folders need a move API call; we keep the mount consistent and
-            // let the next poll pick up the server state.
-            debug!("folder rename is reflected on the next tree refresh");
-            return Ok(());
+    /// Like [`folder_id_for`], but refuse to fall back to the project root when
+    /// the parent is a subfolder whose server id is not known yet: creating
+    /// there would put the entity in the wrong place.
+    fn parent_folder_id(&self, ino: u64) -> Result<Option<String>> {
+        let id = self.folder_id_for(ino);
+        if id.is_none() && ino != ROOT_INO {
+            bail!(
+                "folder '{}' has no server id yet; will not create at the project root",
+                self.fs.path_of(ino)
+            );
         }
+        Ok(id)
+    }
+
+    /// Upload (or re-upload) a non-document file.
+    ///
+    /// A new file whose name did not identify it as text is classified here:
+    /// valid UTF-8 without NUL bytes becomes a normal Overleaf document, and
+    /// anything else is uploaded as a fileRef. Overleaf has no blob documents,
+    /// and a fileRef is replaced wholesale (there is no blob OT type).
+    async fn write_file(self: &Arc<Self>, ino: u64, parent: u64, name: &str) -> Result<()> {
+        let Some(node) = self.fs.node(ino) else {
+            return Ok(());
+        };
         let path = self.fs.path_of(ino);
         if self.fs.is_ignored(&path) {
             return Ok(());
         }
-        match &node.kind {
-            NodeKind::Doc { doc_id, .. } => {
-                self.client
-                    .rename_entity(doc_id, Entity::Doc, new_name)
-                    .await?;
-            }
-            NodeKind::File { .. } => {
-                debug!("binary renames are not supported by the upload API");
-            }
-            _ => {}
+        let NodeKind::File { file_id } = node.kind.clone() else {
+            return Ok(());
+        };
+        let bytes = self.fs.read(ino);
+        let parent_id = self.parent_folder_id(parent)?;
+
+        if let Some(text) = text_content(&bytes) {
+            self.clone().create_doc_at(ino, parent, name, &text).await?;
+            return Ok(());
+        }
+        if bytes.is_empty() && !crate::fsops::looks_like_text(name) {
+            // Created but nothing written yet; wait for real content instead of
+            // uploading an empty fileRef.
+            return Ok(());
+        }
+        let id = retry_transient("upload_file", || {
+            self.client
+                .upload_file(&name, bytes.clone(), parent_id.as_deref())
+        })
+        .await?;
+        if id != file_id {
+            self.fs.set_kind(ino, NodeKind::File { file_id: id });
         }
         Ok(())
     }
 
-    async fn delete(&self, ino: u64, doc_id: Option<String>) -> Result<()> {
-        let Some(doc_id) = doc_id else {
-            return Ok(()); // directory or local-only file
+    async fn rename(
+        &self,
+        ino: u64,
+        old_parent: u64,
+        new_parent: u64,
+        new_name: &str,
+    ) -> Result<()> {
+        let Some(node) = self.fs.node(ino) else {
+            return Ok(());
         };
-        if doc_id.starts_with("pending:") {
-            // Never created on the server (or still being created); nothing to do.
+        let path = self.fs.path_of(ino);
+        if self.fs.is_ignored(&path) {
             return Ok(());
         }
-        if let Err(e) = self.client.delete_doc(&doc_id).await {
-            warn!("could not delete doc {doc_id} on the server: {e:#}");
+        // `pending:` entities are created on the server with whatever name the
+        // node has when the creation intent runs, so there is nothing to rename.
+        let entity = match &node.kind {
+            NodeKind::Doc { doc_id, .. } if !doc_id.starts_with("pending:") => {
+                Some((doc_id.clone(), Entity::Doc))
+            }
+            NodeKind::File { file_id } if !file_id.starts_with("pending:") => {
+                Some((file_id.clone(), Entity::File))
+            }
+            NodeKind::Dir => self.fs.folder_id(ino).map(|id| (id, Entity::Folder)),
+            _ => None,
+        };
+        let Some((id, entity)) = entity else {
+            return Ok(());
+        };
+        retry_transient("rename", || {
+            self.client
+                .rename_entity(&id, entity.clone(), new_name)
+        })
+        .await?;
+        if old_parent != new_parent {
+            let folder = self.parent_folder_id(new_parent)?;
+            retry_transient("move", || {
+                self.client
+                    .move_entity(&id, entity.clone(), folder.as_deref())
+            })
+            .await?;
         }
-        self.fs.doc_inodes.write().remove(&doc_id);
-        self.synced.lock().await.remove(&doc_id);
-        self.desired.lock().await.remove(&doc_id);
-        self.desired_from.lock().await.remove(&doc_id);
-        self.versions.lock().await.remove(&doc_id);
+        Ok(())
+    }
+
+    async fn delete(
+        &self,
+        ino: u64,
+        doc_id: Option<String>,
+        file_id: Option<String>,
+        folder_id: Option<String>,
+    ) -> Result<()> {
+        if let Some(doc_id) = doc_id.filter(|id| !id.starts_with("pending:")) {
+            if let Err(e) = self.client.delete_doc(&doc_id).await {
+                warn!("could not delete doc {doc_id} on the server: {e:#}");
+            }
+            self.fs.doc_inodes.write().remove(&doc_id);
+            self.synced.lock().await.remove(&doc_id);
+            self.desired.lock().await.remove(&doc_id);
+            self.desired_from.lock().await.remove(&doc_id);
+            self.versions.lock().await.remove(&doc_id);
+        }
+        if let Some(file_id) = file_id.filter(|id| !id.starts_with("pending:")) {
+            if let Err(e) = self.client.delete_entity(&file_id, Entity::File).await {
+                warn!("could not delete file {file_id} on the server: {e:#}");
+            }
+        }
+        if let Some(folder_id) = folder_id {
+            if let Err(e) = self.client.delete_entity(&folder_id, Entity::Folder).await {
+                warn!("could not delete folder {folder_id} on the server: {e:#}");
+            }
+        }
         let _ = ino;
         Ok(())
     }
@@ -1174,6 +1377,9 @@ impl SyncEngine {
             .and_then(|r| r.as_array())
             .and_then(|r| r.first())
         {
+            if let Some(id) = root.get("_id").and_then(|x| x.as_str()) {
+                self.fs.set_folder_id(ROOT_INO, id.to_string());
+            }
             self.walk_folder(root, ROOT_INO, &mut doc_ids);
         }
         self.notifier.tree_changed();
@@ -1202,7 +1408,7 @@ impl SyncEngine {
                 };
                 let ino = self.fs.upsert(parent, fname, NodeKind::Dir, 0);
                 if let Some(id) = f.get("_id").and_then(|x| x.as_str()) {
-                    self.folder_ids.lock().unwrap().insert(ino, id.to_string());
+                    self.fs.set_folder_id(ino, id.to_string());
                 }
                 self.walk_folder(f, ino, out);
             }
@@ -1275,12 +1481,14 @@ impl SyncEngine {
         let arr = match payload.as_array() {
             Some(a) => a,
             None => {
+                self.bump_joined(doc_id).await;
                 self.note_contents_loaded().await;
                 return;
             }
         };
         if let Some(err) = arr.first().filter(|e| !e.is_null()) {
             debug!("joinDoc({doc_id}) error: {err}");
+            self.bump_joined(doc_id).await;
             self.note_contents_loaded().await;
             return;
         }
@@ -1318,6 +1526,7 @@ impl SyncEngine {
         self.store_remote_doc_full(doc_id, lines, version, ranges).await;
         // Only now is `synced` populated: signalling before the store made
         // bootstrap observe "missing" for a document that had just arrived.
+        self.bump_joined(doc_id).await;
         self.note_contents_loaded().await;
     }
 

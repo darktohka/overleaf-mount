@@ -85,6 +85,14 @@ pub enum Entity {
     File,
 }
 
+/// Server entities removed by a local unlink/rmdir/rename-replace.
+#[derive(Debug, Default)]
+pub struct Removed {
+    pub docs: Vec<String>,
+    pub files: Vec<String>,
+    pub folders: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Attrs {
     pub mode: u32,
@@ -152,6 +160,8 @@ pub struct Fs {
     pub children: RwLock<BTreeMap<u64, BTreeMap<String, u64>>>,
     /// doc_id -> inode, so OT updates can be routed to the right file.
     pub doc_inodes: RwLock<BTreeMap<String, u64>>,
+    /// inode -> server folder id, for directories that exist on Overleaf.
+    pub folder_ids: RwLock<BTreeMap<u64, String>>,
     /// document contents by inode, and the version we believe is on the server.
     pub docs: RwLock<BTreeMap<u64, Doc>>,
     /// Local-only content (gitignored files) by inode.
@@ -207,6 +217,7 @@ impl Fs {
             nodes: RwLock::new(nodes),
             children: RwLock::new(children),
             doc_inodes: RwLock::new(BTreeMap::new()),
+            folder_ids: RwLock::new(BTreeMap::new()),
             docs: RwLock::new(BTreeMap::new()),
             local: RwLock::new(BTreeMap::new()),
             ignored: RwLock::new(BTreeMap::new()),
@@ -339,15 +350,31 @@ impl Fs {
         ino
     }
 
-    /// Remove a node and its subtree; returns removed doc ids.
-    pub fn remove(&self, ino: u64) -> Vec<String> {
-        let mut removed_docs = Vec::new();
+    pub fn set_kind(&self, ino: u64, kind: NodeKind) {
+        if let Some(n) = self.nodes.write().get_mut(&ino) {
+            n.kind = kind;
+        }
+        self.bump();
+    }
+
+    pub fn set_folder_id(&self, ino: u64, id: String) {
+        self.folder_ids.write().insert(ino, id);
+    }
+
+    pub fn folder_id(&self, ino: u64) -> Option<String> {
+        self.folder_ids.read().get(&ino).cloned()
+    }
+
+    /// Remove a node and its subtree; returns the server entity ids that are
+    /// no longer represented on the mount.
+    pub fn remove(&self, ino: u64) -> Removed {
+        let mut removed = Removed::default();
         if ino == ROOT_INO {
-            return removed_docs;
+            return removed;
         }
         let (parent, name) = match self.nodes.read().get(&ino) {
             Some(n) => (n.parent, n.name.clone()),
-            None => return removed_docs,
+            None => return removed,
         };
         // collect subtree
         let mut stack = vec![ino];
@@ -363,15 +390,28 @@ impl Fs {
             let mut docs = self.docs.write();
             let mut local = self.local.write();
             let mut doc_inodes = self.doc_inodes.write();
+            let mut folder_ids = self.folder_ids.write();
             let mut children = self.children.write();
             for cur in all {
                 if let Some(n) = nodes.remove(&cur) {
                     match &n.kind {
                         NodeKind::Doc { doc_id, .. } => {
-                            removed_docs.push(doc_id.clone());
+                            if !doc_id.starts_with("pending:") {
+                                removed.docs.push(doc_id.clone());
+                            }
                             doc_inodes.remove(doc_id);
                         }
-                        _ => {}
+                        NodeKind::File { file_id } => {
+                            if !file_id.starts_with("pending:") {
+                                removed.files.push(file_id.clone());
+                            }
+                        }
+                        NodeKind::Dir => {
+                            if let Some(id) = folder_ids.remove(&cur) {
+                                removed.folders.push(id);
+                            }
+                        }
+                        NodeKind::LocalFile => {}
                     }
                 }
                 docs.remove(&cur);
@@ -383,7 +423,7 @@ impl Fs {
             }
         }
         self.bump();
-        removed_docs
+        removed
     }
 
     /// Move/rename `ino` to `new_parent`/`new_name`.
@@ -393,7 +433,7 @@ impl Fs {
     ///
     /// Returns the inode and the document ids that the replacement removed, so
     /// the caller can delete them on the server.
-    pub fn r#move(&self, ino: u64, new_parent: u64, new_name: &str) -> Result<(u64, Vec<String>), i32> {
+    pub fn r#move(&self, ino: u64, new_parent: u64, new_name: &str) -> Result<(u64, Removed), i32> {
         let (old_parent, old_name) = match self.nodes.read().get(&ino) {
             Some(n) => (n.parent, n.name.clone()),
             None => return Err(libc::ENOENT),
@@ -402,10 +442,10 @@ impl Fs {
             Some(n) => n.is_dir(),
             None => return Err(libc::ENOENT),
         };
-        let mut removed_docs = Vec::new();
+        let mut removed = Removed::default();
         if let Some(dest) = self.lookup(new_parent, new_name) {
             if dest == ino {
-                return Ok((ino, removed_docs));
+                return Ok((ino, removed));
             }
             let dest_is_dir = match self.nodes.read().get(&dest) {
                 Some(n) => n.is_dir(),
@@ -428,9 +468,9 @@ impl Fs {
                 }
                 (false, false) => {}
             }
-            removed_docs = self.remove(dest);
+            removed = self.remove(dest);
         } else if old_parent == new_parent && old_name == new_name {
-            return Ok((ino, removed_docs));
+            return Ok((ino, removed));
         }
         // forbid moving a directory inside itself
         let mut cur = new_parent;
@@ -464,7 +504,7 @@ impl Fs {
             }
         }
         self.bump();
-        Ok((ino, removed_docs))
+        Ok((ino, removed))
     }
 
     /// Read the full text content of a doc/local node.
@@ -650,7 +690,7 @@ mod tests {
         );
         let (ino, removed) = fs.r#move(lock, ROOT_INO, "config").unwrap();
         assert_eq!(ino, lock);
-        assert_eq!(removed, vec!["old".to_string()]);
+        assert_eq!(removed.docs, vec!["old".to_string()]);
         assert_eq!(fs.lookup(ROOT_INO, "config"), Some(lock));
         assert_eq!(fs.lookup(ROOT_INO, "config.lock"), None);
         assert!(fs.node(old).is_none());
@@ -667,16 +707,6 @@ mod tests {
         assert_eq!(fs.r#move(f, ROOT_INO, "b").unwrap_err(), libc::EISDIR);
         let d = fs.upsert(ROOT_INO, "d", NodeKind::Dir, 0);
         assert_eq!(fs.r#move(d, ROOT_INO, "f").unwrap_err(), libc::ENOTDIR);
-    }
-
-    #[test]
-    fn dot_git_is_always_local() {
-        use crate::gitignore::Ignorer;
-        let ig = Ignorer::with_root_rules("/.git\n");
-        assert!(ig.is_ignored(".git"));
-        assert!(ig.is_ignored(".git/config"));
-        assert!(ig.is_ignored(".git/objects/ab/cdef"));
-        assert!(!ig.is_ignored("git/config"));
     }
 
     #[test]

@@ -147,24 +147,19 @@ async fn main() -> Result<()> {
     engine.bootstrap().await.context("loading project")?;
 
     // .gitignore: read the project's own file (if the project has one) and any
-    // user-supplied extra rules. Matching files stay local-only.
-    //
-    // `.git` is always local-only: the mount is a working copy, and pushing
-    // version-control internals into the Overleaf project (as thousands of
-    // docs and folders) is never what the user wants. The anchored rule also
-    // covers everything below it.
-    let mut rules = String::from("/.git\n");
+    // user-supplied extra rules. Matching files stay local-only. Nothing else is
+    // special-cased: `.git` and every other file in the project are mirrored.
+    let mut ignorer = Ignorer::new();
     if let Some(extra) = &args.gitignore {
         if let Ok(text) = std::fs::read_to_string(extra) {
-            rules.push_str(&text);
+            ignorer = Ignorer::with_root_rules(&text);
         }
     } else if let Some(ino) = fs.lookup(ROOT_INO, ".gitignore") {
         if let Some(doc) = fs.doc(ino) {
-            rules.push_str(&doc.text());
+            ignorer = Ignorer::with_root_rules(&doc.text());
             info!("honouring the project's .gitignore");
         }
     }
-    let ignorer = Ignorer::with_root_rules(&rules);
     // Record which tree entries are ignored, and drop them from the sync set.
     {
         let paths: Vec<(u64, String)> = fs

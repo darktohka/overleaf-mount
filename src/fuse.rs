@@ -126,7 +126,7 @@ impl OverleafFs {
         let NodeKind::File { file_id } = node.kind else {
             return Ok(());
         };
-        if node.data.is_some() || file_id.is_empty() {
+        if node.data.is_some() || file_id.is_empty() || file_id.starts_with("pending:") {
             return Ok(());
         }
         let (tx, rx) = std::sync::mpsc::channel();
@@ -160,7 +160,7 @@ impl OverleafFs {
         let NodeKind::File { file_id } = node.kind else {
             return;
         };
-        if node.data.is_some() || file_id.is_empty() {
+        if node.data.is_some() || file_id.is_empty() || file_id.starts_with("pending:") {
             return;
         }
         if !self.size_probed.lock().insert(ino) {
@@ -176,6 +176,21 @@ impl OverleafFs {
             Ok(Ok(size)) => { trace!("file {file_id}: size {size}"); self.fs.set_size(ino, size) },
             Ok(Err(e)) => debug!("uploaded file {file_id}: size probe failed: {e:#}"),
             Err(_) => debug!("uploaded file {file_id}: size probe timed out"),
+        }
+    }
+
+    /// Push a dirty node: documents over OT, uploaded files by replacing the
+    /// server copy (there is no blob OT type).
+    fn push_dirty(&self, ino: u64) {
+        let Some(node) = self.fs.node(ino) else { return };
+        match node.kind {
+            NodeKind::Doc { .. } => self.push_current(ino),
+            NodeKind::File { .. } => self.sync.send(Outgoing::WriteFile {
+                ino,
+                parent: node.parent,
+                name: node.name.clone(),
+            }),
+            _ => {}
         }
     }
 
@@ -337,7 +352,17 @@ impl Filesystem for OverleafFs {
                             self.push_current(ino);
                         }
                         NodeKind::LocalFile => self.fs.set_local(ino, data),
-                        _ => {}
+                        NodeKind::File { .. } => {
+                            self.fs.set_file_data(ino, data);
+                            if let Some(n) = self.fs.node(ino) {
+                                self.sync.send(Outgoing::WriteFile {
+                                    ino,
+                                    parent: n.parent,
+                                    name: n.name.clone(),
+                                });
+                            }
+                        }
+                        NodeKind::Dir => {}
                     }
                 }
             }
@@ -397,8 +422,13 @@ impl Filesystem for OverleafFs {
         {
             return reply.error(libc::ENOTEMPTY);
         }
-        self.fs.remove(ino);
-        self.sync.send(Outgoing::Delete { ino, doc_id: None });
+        let removed = self.fs.remove(ino);
+        self.sync.send(Outgoing::Delete {
+            ino,
+            doc_id: None,
+            file_id: None,
+            folder_id: removed.folders.first().cloned(),
+        });
         reply.ok();
     }
 
@@ -409,15 +439,30 @@ impl Filesystem for OverleafFs {
         let Some(ino) = self.fs.lookup(parent, name) else {
             return reply.error(libc::ENOENT);
         };
-        // Capture the document id *before* removing the node: the engine runs
+        // Capture the entity ids *before* removing the node: the engine runs
         // asynchronously, so by the time it handles the intent the inode is
-        // gone and the server document would never be deleted.
-        let doc_id = match self.fs.node(ino).map(|n| n.kind) {
-            Some(NodeKind::Doc { doc_id, .. }) => Some(doc_id),
-            _ => None,
-        };
-        self.fs.remove(ino);
-        self.sync.send(Outgoing::Delete { ino, doc_id });
+        // gone and the server entity would never be deleted.
+        let kind = self.fs.node(ino).map(|n| n.kind);
+        let removed = self.fs.remove(ino);
+        match kind {
+            Some(NodeKind::Doc { .. }) => {
+                self.sync.send(Outgoing::Delete {
+                    ino,
+                    doc_id: removed.docs.first().cloned(),
+                    file_id: None,
+                    folder_id: None,
+                });
+            }
+            Some(NodeKind::File { .. }) => {
+                self.sync.send(Outgoing::Delete {
+                    ino,
+                    doc_id: None,
+                    file_id: removed.files.first().cloned(),
+                    folder_id: None,
+                });
+            }
+            _ => {}
+        }
         reply.ok();
     }
 
@@ -444,17 +489,36 @@ impl Filesystem for OverleafFs {
             return reply.error(libc::EEXIST);
         }
         match self.fs.r#move(ino, newparent, newname) {
-            Ok((ino, removed_docs)) => {
+            Ok((ino, removed)) => {
                 // rename(2) may replace an existing entry; anything it pushed
                 // out must be deleted on the server too, or it lingers there.
-                for doc_id in removed_docs {
+                for doc_id in removed.docs {
                     self.sync.send(Outgoing::Delete {
                         ino,
                         doc_id: Some(doc_id),
+                        file_id: None,
+                        folder_id: None,
+                    });
+                }
+                for file_id in removed.files {
+                    self.sync.send(Outgoing::Delete {
+                        ino,
+                        doc_id: None,
+                        file_id: Some(file_id),
+                        folder_id: None,
+                    });
+                }
+                for folder_id in removed.folders {
+                    self.sync.send(Outgoing::Delete {
+                        ino,
+                        doc_id: None,
+                        file_id: None,
+                        folder_id: Some(folder_id),
                     });
                 }
                 self.sync.send(Outgoing::Rename {
                     ino,
+                    old_parent: parent,
                     new_parent: newparent,
                     new_name: newname.to_string(),
                 });
@@ -555,7 +619,11 @@ impl Filesystem for OverleafFs {
                 self.fs.set_local(ino, buf);
             }
             NodeKind::File { .. } => {
-                return reply.error(libc::EROFS);
+                // Buffer locally; the upload happens on flush/release.
+                self.fs.set_file_data(ino, buf);
+                if let Some(h) = self.handles.lock().get_mut(&fh) {
+                    h.dirty = true;
+                }
             }
             NodeKind::Dir => return reply.error(libc::EISDIR),
         }
@@ -575,7 +643,7 @@ impl Filesystem for OverleafFs {
         let handle = self.handles.lock().remove(&fh);
         if let Some(h) = handle {
             if h.dirty {
-                self.push_current(h.ino);
+                self.push_dirty(h.ino);
             }
         }
         let _ = ino;
@@ -596,7 +664,7 @@ impl Filesystem for OverleafFs {
         let handle = self.handles.lock().remove(&fh);
         if let Some(h) = handle {
             if h.dirty {
-                self.push_current(h.ino);
+                self.push_dirty(h.ino);
             }
         }
         let _ = ino;
@@ -627,9 +695,12 @@ impl Filesystem for OverleafFs {
             format!("{parent_path}/{name}")
         };
         let write = flags & libc::O_ACCMODE as i32 != libc::O_RDONLY as i32;
-        let ino = if fsops::looks_like_text(name) && !self.fs.is_ignored(&full_path) {
-            // Optimistically create a local doc node; the engine turns it into
-            // a real Overleaf document and fills in the doc id.
+        let ino = if self.fs.is_ignored(&full_path) {
+            // Gitignored: local-only, never sent to Overleaf.
+            self.fs.upsert(parent, name, NodeKind::LocalFile, 0)
+        } else if fsops::looks_like_text(name) {
+            // A known text extension: optimistically create a doc node; the
+            // engine turns it into a real Overleaf document and fills in the id.
             self.fs.upsert(
                 parent,
                 name,
@@ -640,8 +711,18 @@ impl Filesystem for OverleafFs {
                 0,
             )
         } else {
-            self.fs.mark_ignored(&full_path, true);
-            self.fs.upsert(parent, name, NodeKind::LocalFile, 0)
+            // Unknown extension (or none, e.g. `.git/index`, `.git/objects/ab/cdef`).
+            // The first flush decides: UTF-8 text becomes an Overleaf document,
+            // anything else is uploaded as a fileRef (Overleaf has no blob
+            // documents, but uploaded files hold arbitrary bytes).
+            self.fs.upsert(
+                parent,
+                name,
+                NodeKind::File {
+                    file_id: format!("pending:{full_path}"),
+                },
+                0,
+            )
         };
         // `.sh` scripts are executable by default (the mount contract), even
         // though the kernel asks for plain 0644 when the file is created.
@@ -775,8 +856,8 @@ impl Filesystem for OverleafFs {
                 h.ino
             })
         };
-        if let Some(doc_ino) = dirty {
-            self.push_current(doc_ino);
+        if let Some(dirty_ino) = dirty {
+            self.push_dirty(dirty_ino);
         }
         let _ = ino;
         reply.ok();
