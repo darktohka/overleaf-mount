@@ -768,13 +768,40 @@ impl OverleafClient {
     }
 
     /// Download an uploaded file's content.
+    ///
+    /// The public route is capitalised (`/Project/:id/file/:file_id`); the
+    /// lowercase path only exists as the `DELETE` in the editor API, so a
+    /// lowercase GET falls through to the 404 page.
     pub async fn get_file(&self, file_id: &str) -> Result<Vec<u8>> {
-        let url = self.url(&format!("/project/{}/file/{}", self.project_id, file_id));
+        let url = self.url(&format!("/Project/{}/file/{}", self.project_id, file_id));
         let res = self.get(url).await?;
         if !res.status().is_success() {
             bail!("get_file {file_id} -> {}", res.status());
         }
         Ok(res.bytes().await?.to_vec())
+    }
+
+    /// Size of an uploaded file without downloading it.
+    ///
+    /// `FileStoreController.getFileHead` answers `HEAD` on the same route the
+    /// browser uses, so a directory listing gets real sizes for the cost of one
+    /// header request per file.
+    pub async fn get_file_size(&self, file_id: &str) -> Result<u64> {
+        let url = self.url(&format!("/Project/{}/file/{}", self.project_id, file_id));
+        let res = self
+            .send_with_auth(reqwest::Method::HEAD, url, None)
+            .await
+            .context("private API get_file_size")?;
+        if !res.status().is_success() {
+            bail!("get_file_size {file_id} -> {}", res.status());
+        }
+        // `Response::content_length()` reports 0 for a HEAD response (there is
+        // no body to measure), so read the header itself.
+        res.headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| anyhow!("get_file_size {file_id}: no content-length"))
     }
 
     /// Rename / move any entity.

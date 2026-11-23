@@ -6,6 +6,7 @@
 //! `Notifier` to invalidate the kernel's page cache when the server sends us
 //! somebody else's edit.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use log::{debug, trace, warn};
 use parking_lot::Mutex;
 
 use crate::fsops::{self, decode_name, file_attr, new_attrs};
+use crate::overleaf::OverleafClient;
 use crate::sync::{Notifier, Outgoing, SyncHandle};
 use crate::types::{Doc, Entity, Fs, NodeKind, ROOT_INO};
 
@@ -40,6 +42,15 @@ struct Handle {
 pub struct OverleafFs {
     pub fs: Arc<Fs>,
     pub sync: SyncHandle,
+    /// Used to pull the content (and size) of uploaded files on first access;
+    /// Overleaf has no socket event that carries a fileRef's bytes.
+    client: Arc<OverleafClient>,
+    /// Runtime the HTTP requests are spawned on. FUSE callbacks run on a
+    /// blocking worker, so they can wait for the reply without stalling it.
+    rt: tokio::runtime::Handle,
+    /// Inodes whose size has already been probed with `HEAD` (successfully or
+    /// not), so repeated stats do not hammer the server.
+    size_probed: Mutex<HashSet<u64>>,
     handles: Mutex<std::collections::HashMap<u64, Handle>>,
     next_fh: AtomicU64,
     /// Order in which write intents were observed, used to discard ones that the
@@ -51,10 +62,18 @@ pub struct OverleafFs {
 }
 
 impl OverleafFs {
-    pub fn new(fs: Arc<Fs>, sync: SyncHandle) -> Self {
+    pub fn new(
+        fs: Arc<Fs>,
+        sync: SyncHandle,
+        client: Arc<OverleafClient>,
+        rt: tokio::runtime::Handle,
+    ) -> Self {
         Self {
             fs,
             sync,
+            client,
+            rt,
+            size_probed: Mutex::new(HashSet::new()),
             handles: Mutex::new(std::collections::HashMap::new()),
             next_fh: AtomicU64::new(1),
             write_seq: AtomicU64::new(1),
@@ -63,6 +82,7 @@ impl OverleafFs {
     }
 
     fn attr_for(&self, ino: u64) -> Option<FileAttr> {
+        self.ensure_file_size(ino);
         let node = self.fs.node(ino)?;
         let size = match &node.kind {
             NodeKind::Dir => 0,
@@ -90,6 +110,73 @@ impl OverleafFs {
     /// Read current bytes of a file node.
     fn read_bytes(&self, ino: u64) -> Vec<u8> {
         self.fs.read(ino)
+    }
+
+    /// Download `ino` when it is an uploaded file whose bytes are not cached.
+    ///
+    /// Overleaf never streams a fileRef's content over the socket, and the tree
+    /// only carries an id, so the first `read` has to fetch it. FUSE callbacks
+    /// are synchronous and run on the blocking thread that owns the mount, so
+    /// the request is spawned on the async runtime and this thread waits for
+    /// the result with a deadline.
+    fn ensure_file_content(&self, ino: u64) -> Result<(), i32> {
+        let Some(node) = self.fs.node(ino) else {
+            return Err(libc::ENOENT);
+        };
+        let NodeKind::File { file_id } = node.kind else {
+            return Ok(());
+        };
+        if node.data.is_some() || file_id.is_empty() {
+            return Ok(());
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let client = self.client.clone();
+        let id = file_id.clone();
+        self.rt.spawn(async move {
+            let _ = tx.send(client.get_file(&id).await);
+        });
+        match rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(Ok(bytes)) => {
+                self.fs.set_file_data(ino, bytes);
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                warn!("uploaded file {file_id}: download failed: {e:#}");
+                Err(libc::EIO)
+            }
+            Err(_) => {
+                warn!("uploaded file {file_id}: download timed out");
+                Err(libc::EIO)
+            }
+        }
+    }
+
+    /// Learn an uploaded file's size with a cheap `HEAD`, at most once per
+    /// inode, so `ls -l` shows real sizes without downloading every upload.
+    fn ensure_file_size(&self, ino: u64) {
+        let Some(node) = self.fs.node(ino) else {
+            return;
+        };
+        let NodeKind::File { file_id } = node.kind else {
+            return;
+        };
+        if node.data.is_some() || file_id.is_empty() {
+            return;
+        }
+        if !self.size_probed.lock().insert(ino) {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let client = self.client.clone();
+        let id = file_id.clone();
+        self.rt.spawn(async move {
+            let _ = tx.send(client.get_file_size(&id).await);
+        });
+        match rx.recv_timeout(Duration::from_secs(20)) {
+            Ok(Ok(size)) => { trace!("file {file_id}: size {size}"); self.fs.set_size(ino, size) },
+            Ok(Err(e)) => debug!("uploaded file {file_id}: size probe failed: {e:#}"),
+            Err(_) => debug!("uploaded file {file_id}: size probe timed out"),
+        }
     }
 
     /// Push the node's current text to Overleaf, stamped with the next sequence
@@ -392,6 +479,9 @@ impl Filesystem for OverleafFs {
         reply: ReplyData,
     ) {
         let _ = fh;
+        if let Err(e) = self.ensure_file_content(ino) {
+            return reply.error(e);
+        }
         let data = self.read_bytes(ino);
         let start = offset.max(0) as usize;
         if start >= data.len() {

@@ -192,7 +192,12 @@ async fn main() -> Result<()> {
     };
 
     // Mount in a blocking thread; FUSE's session loop is synchronous.
-    let fuse_fs = OverleafFs::new(fs.clone(), handle.clone());
+    let fuse_fs = OverleafFs::new(
+        fs.clone(),
+        handle.clone(),
+        client.clone(),
+        tokio::runtime::Handle::current(),
+    );
     let mountpoint = args.mount.clone();
     let allow_other = args.allow_other;
     let auto_unmount = !args.no_auto_unmount;

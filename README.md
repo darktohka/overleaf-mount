@@ -68,7 +68,9 @@ Ctrl+C or `SIGTERM` unmounts cleanly, and the mount is created with
   for `latexmk` without polluting the project. Nested `.gitignore` files and
   `!re-include` rules work, and an ancestor match (`build/`) covers children.
 * **Binary uploads** are read-only (`EROFS` on write): Overleaf's OT types have no
-  notion of a blob edit.
+  notion of a blob edit. Their content is not streamed with the tree, so the
+  first `stat` learns the size with a `HEAD` and the first `read` downloads the
+  bytes; both are cached in memory for the life of the mount.
 
 ## Text encoding and line endings
 

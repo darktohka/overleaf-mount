@@ -281,6 +281,20 @@ impl Fs {
                         .get(&ino)
                         .map(|d| d.text().len() as u64)
                         .unwrap_or(size)
+                } else if matches!(kind, NodeKind::File { .. }) {
+                    // A cached upload keeps its downloaded bytes (and the size
+                    // they imply); a refresh payload re-states files with size 0
+                    // and must not make them look empty again.
+                    self.nodes
+                        .read()
+                        .get(&ino)
+                        .map(|n| {
+                            n.data
+                                .as_ref()
+                                .map(|d| d.len() as u64)
+                                .unwrap_or(n.size)
+                        })
+                        .unwrap_or(size)
                 } else {
                     size
                 };
@@ -452,6 +466,22 @@ impl Fs {
         }
         self.local.write().insert(ino, data);
         self.bump();
+    }
+
+    /// Cache the bytes of an uploaded file in its inode (`NodeKind::File`).
+    pub fn set_file_data(&self, ino: u64, data: Vec<u8>) {
+        if let Some(n) = self.nodes.write().get_mut(&ino) {
+            n.size = data.len() as u64;
+            n.data = Some(data);
+        }
+        self.bump();
+    }
+
+    /// Record a size learned without downloading the file (a `HEAD` request).
+    pub fn set_size(&self, ino: u64, size: u64) {
+        if let Some(n) = self.nodes.write().get_mut(&ino) {
+            n.size = size;
+        }
     }
 
     pub fn set_attrs(&self, ino: u64, f: impl FnOnce(&mut Attrs)) -> Result<(), i32> {
