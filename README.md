@@ -44,7 +44,7 @@ Ctrl+C or `SIGTERM` unmounts cleanly, and the mount is created with
 | `--realtime-url <URL>` | socket.io host; defaults to `--url` (nginx proxies `/socket.io` there). Point it at `http://127.0.0.1:3026` for a bare dev stack |
 | `--api-user`, `--api-password` | Credentials for web's private API; enables project/document HTTP access and the no-socket fallback |
 | `--uid`, `--gid` | Owner of every file and directory on the mount (default: the caller's) |
-| `--allow-other` | Let other users access the mount |
+| `--allow-other` | Let other users access the mount. `auto_unmount` (on by default) already implies it: `fusermount` refuses `auto_unmount` without it |
 | `--gitignore <FILE>` | Extra ignore file (default: the project's own `.gitignore`) |
 | `--no-auto-unmount` | Debugging aid: leave the mount in place on exit |
 

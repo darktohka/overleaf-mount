@@ -210,7 +210,15 @@ async fn main() -> Result<()> {
     if auto_unmount {
         options.push(fuser::MountOption::AutoUnmount);
     }
-    if allow_other {
+    // fuser mounts auto_unmount filesystems with allow_other (fusermount
+    // requires it) but still decides the *userspace* ACL from the options the
+    // caller passed: without an explicit AllowOther it uses SessionACL::Owner
+    // and rejects every request whose uid is not the daemon's. That makes a
+    // root-started mount with `--uid 1000` unusable for uid 1000 — lookup,
+    // getattr and open all come back EACCES even though the kernel would allow
+    // them. Ask for allow_other ourselves so fuser accepts the requests and the
+    // kernel's default_permissions does the actual checking.
+    if allow_other || auto_unmount {
         options.push(fuser::MountOption::AllowOther);
     }
 
@@ -251,45 +259,44 @@ fn install_signal_handlers(
         signal_hook::consts::SIGTERM,
         signal_hook::consts::SIGQUIT,
     ] {
-        let mp = mountpoint.clone();
-        let shutdown = shutdown.clone();
-        let fs = fs.clone();
         signal_hook::flag::register(sig, shutdown.clone())?;
-        // A dedicated thread performs the unmount so a signal during a blocking
-        // FUSE call still tears the mount down.
-        std::thread::Builder::new()
-            .name(format!("signal-{sig}"))
-            .spawn(move || {
-                // Wait for the flag to be set by any registered signal.
-                while !shutdown.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                info!("signal received: unmounting {}", mp.display());
-                for _ in 0..40 {
-                    let status = std::process::Command::new("fusermount3")
-                        .arg("-u")
-                        .arg("-z")
-                        .arg(&mp)
-                        .status();
-                    match status {
-                        Ok(s) if s.success() => break,
-                        _ => {
-                            let alt = std::process::Command::new("umount")
-                                .arg("-l")
-                                .arg(&mp)
-                                .status();
-                            if matches!(alt, Ok(s) if s.success()) {
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(100));
+    }
+    // One watcher for the shared flag: spawning a thread per signal made all of
+    // them race fusermount3 for the same mountpoint, so one unmount succeeded
+    // while the others printed "failed to unmount …: Invalid argument" (and
+    // "not mounted" from the umount fallback).
+    std::thread::Builder::new()
+        .name("signal-unmount".to_string())
+        .spawn(move || {
+            // Wait for the flag to be set by any registered signal.
+            while !shutdown.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            info!("signal received: unmounting {}", mountpoint.display());
+            for _ in 0..40 {
+                let status = std::process::Command::new("fusermount3")
+                    .arg("-u")
+                    .arg("-z")
+                    .arg(&mountpoint)
+                    .status();
+                match status {
+                    Ok(s) if s.success() => break,
+                    _ => {
+                        let alt = std::process::Command::new("umount")
+                            .arg("-l")
+                            .arg(&mountpoint)
+                            .status();
+                        if matches!(alt, Ok(s) if s.success()) {
+                            break;
                         }
+                        std::thread::sleep(Duration::from_millis(100));
                     }
                 }
-                let _ = fs.bump();
-                std::process::exit(0);
-            })
-            .ok();
-    }
+            }
+            let _ = fs.bump();
+            std::process::exit(0);
+        })
+        .ok();
     Ok(())
 }
 

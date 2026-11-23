@@ -433,6 +433,12 @@ impl OverleafClient {
             .with_context(|| format!("parsing GET {path} response: {}", truncate(&text, 300)))
     }
 
+    /// True when the private API credentials are configured, i.e. `/join` (the
+    /// only HTTP endpoint that carries document ids) can be used.
+    pub fn has_api_auth(&self) -> bool {
+        self.api_auth.is_some()
+    }
+
     /// Fetch project metadata: root folder docs + file refs + uploads.
     pub async fn fetch_project(&self) -> Result<ProjectMeta> {
         // Preferred: web's private `/project/:id/join`, the same call real-time
@@ -495,7 +501,7 @@ impl OverleafClient {
     }
 
     /// `/project/:id/entities` — names and paths only, no document ids. Kept as
-    /// a last resort so the mount still lists a project read-only.
+    /// a last resort so the mount still lists the project read-only.
     async fn fetch_project_entities(&self) -> Result<ProjectMeta> {
         let v: Value = self
             .get_json(&format!("/project/{}/entities", self.project_id))
@@ -503,10 +509,35 @@ impl OverleafClient {
             .context("fetching project")?;
         let mut meta = parse_project_meta(&self.project_id, &v)?;
 
-        // Names without ids: the caller can list the project but cannot read
-        // document content, which is what makes this the last resort.
-        if meta.docs.is_empty() {
-            warn!("no document ids available: browsing will be read-only");
+        // Unlike `/join`, this endpoint answers with a flat
+        // `{"entities":[{"path":"/a/b.tex","type":"doc"}, …]}` list, so the
+        // `rootFolder` walk above sees nothing. Rebuild the directory skeleton
+        // from the paths: `/entities` does not emit folder entries, but every
+        // parent of an entity is a directory. Documents and files themselves are
+        // dropped — without their ids they cannot be opened, and listing them
+        // would make the mount look usable while every read fails.
+        if let Some(list) = v.get("entities").and_then(|e| e.as_array()) {
+            for e in list {
+                let Some(path) = e.get("path").and_then(|p| p.as_str()) else {
+                    continue;
+                };
+                let mut parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+                let is_folder = e.get("type").and_then(|t| t.as_str()) == Some("folder");
+                // A folder entity names the directory; anything else names an
+                // entry inside it, so its own path component is not a directory.
+                if !is_folder {
+                    parts.pop();
+                }
+                for depth in 1..=parts.len() {
+                    let dir = parts[..depth].join("/");
+                    if !meta.folders.iter().any(|f| f.path == dir) {
+                        meta.folders.push(RootFolder {
+                            id: String::new(),
+                            path: dir,
+                        });
+                    }
+                }
+            }
         }
         Ok(meta)
     }

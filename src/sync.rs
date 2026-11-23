@@ -296,6 +296,11 @@ impl SyncEngine {
         if ready.is_err() {
             warn!("real-time did not deliver the project tree; using HTTP fallback");
             let meta = self.client.fetch_project().await?;
+            if meta.docs.is_empty() {
+                // Only worth saying once, at startup: a tree refresh cannot fix
+                // it, and repeating the warning every poll interval is noise.
+                warn!("no document ids available: browsing will be read-only");
+            }
             self.rebuild_tree(&meta).await?;
             let mut versions = HashMap::new();
             for entry in &meta.docs {
@@ -1610,6 +1615,20 @@ impl SyncEngine {
     }
 
     async fn refresh_tree(&self) -> Result<()> {
+        // The socket is the authoritative tree: `joinProjectResponse` carries
+        // document ids and structure changes arrive as socket events. The HTTP
+        // fallbacks only exist for when it is down — `/entities` answers with a
+        // flat list that has no ids, so refreshing through it while the socket
+        // is live can never add a document and only produced a misleading
+        // "no document ids available" warning on every tick. `/join` does carry
+        // ids, so keep refreshing when the private API is configured.
+        if self
+            .socket_up
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && !self.client.has_api_auth()
+        {
+            return Ok(());
+        }
         let meta = self.client.fetch_project().await?;
         let mut before: Vec<String> = self.fs.nodes.read().values().map(|n| n.name.clone()).collect();
         before.sort();
