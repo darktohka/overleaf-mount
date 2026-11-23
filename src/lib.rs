@@ -8,5 +8,6 @@ pub mod gitignore;
 pub mod merge3;
 pub mod ot;
 pub mod overleaf;
+pub mod ratelimit;
 pub mod sync;
 pub mod types;

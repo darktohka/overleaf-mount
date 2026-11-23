@@ -42,12 +42,17 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::merge3;
 use crate::ot::{self, TextOp};
 use crate::overleaf::OverleafClient;
+use crate::ratelimit::RateLimited;
 use crate::types::{Doc, Entity, Fs, NodeKind, ROOT_INO};
 
 /// How long we tolerate a socket outage before falling back to polling.
 const RECONNECT_GRACE: Duration = Duration::from_secs(2);
 /// Poll interval in fallback mode.
 const POLL_INTERVAL: Duration = Duration::from_millis(700);
+/// How long a rate-limited intent keeps retrying before it is reported. The
+/// upload window is 15 minutes server-side, so this is deliberately longer than
+/// a naive exponential backoff would allow.
+const RATE_LIMIT_RETRY_BUDGET: Duration = Duration::from_secs(600);
 /// How often to re-read project metadata (new files/folders).
 const TREE_REFRESH: Duration = Duration::from_secs(10);
 
@@ -118,19 +123,38 @@ fn chrono_millis() -> u128 {
 }
 
 /// True when an error is Overleaf's rate limiter (HTTP 429).
+///
+/// The client returns a typed [`RateLimited`] for a 429, so this does not have
+/// to guess from a formatted message; the string check remains as a fallback for
+/// errors built elsewhere (e.g. a proxy page with a 429 in its text).
 fn is_rate_limited(e: &anyhow::Error) -> bool {
-    e.to_string().contains("429")
+    e.downcast_ref::<RateLimited>().is_some() || e.to_string().contains("429")
 }
 
-/// Overleaf rate-limits entity creation (60 folders/min, 30 docs/min) and the
-/// rename endpoint rejects a name that still exists because the delete of the
-/// replaced entity has not landed yet. Both are transient: retry with backoff
-/// instead of dropping the intent.
+/// Spread retries so several failing intents do not retry in lockstep.
+fn jitter(d: Duration) -> Duration {
+    use rand::Rng;
+    let factor = rand::thread_rng().gen_range(0.85..=1.15);
+    d.mul_f64(factor)
+}
+
+/// Overleaf rate-limits entity creation (60 folders/min, 30 docs/min, uploads
+/// 500/15 min) and the rename endpoint rejects a name that still exists because
+/// the delete of the replaced entity has not landed yet. Both are transient:
+/// retry instead of dropping the intent.
+///
+/// Rate-limit waits are *not* slept here in full: every request goes through the
+/// client's shared limiter, which blocks on the global cooldown the 429
+/// installed, so retrying after a short pause lets that gate do the waiting
+/// (and lets the pacing window of the endpoint absorb the burst). The retry
+/// budget is time-based for the same reason — a 60 s window can outlast a fixed
+/// number of exponential attempts.
 async fn retry_transient<F, Fut, T>(what: &str, mut f: F) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
+    let deadline = tokio::time::Instant::now() + RATE_LIMIT_RETRY_BUDGET;
     let mut delay = Duration::from_millis(300);
     let mut attempt = 0;
     loop {
@@ -138,18 +162,28 @@ where
         match f().await {
             Ok(v) => return Ok(v),
             Err(e) => {
-                let transient = is_rate_limited(&e)
+                let limited = is_rate_limited(&e);
+                let transient = limited
                     || e.to_string().contains("already exists")
                     || e.to_string().contains("folder_not_found");
-                if !transient || attempt >= 10 {
+                if !transient {
                     return Err(e);
                 }
+                if tokio::time::Instant::now() >= deadline || attempt >= 60 {
+                    warn!("{what}: still failing after {attempt} attempts, giving up: {e:#}");
+                    return Err(e);
+                }
+                let wait = if limited {
+                    Duration::from_millis(250)
+                } else {
+                    jitter(delay)
+                };
                 debug!(
                     "{what}: transient error ({e:#}); retrying in {} ms",
-                    delay.as_millis()
+                    wait.as_millis()
                 );
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_secs(30));
+                tokio::time::sleep(wait).await;
+                delay = (delay * 2).min(Duration::from_secs(15));
             }
         }
     }
@@ -572,6 +606,10 @@ impl SyncEngine {
                     // refused HTTP fallback must not lose the user's edit (they
                     // already got a successful write(2) from the kernel).
                     warn!("sync error for {doc_id}: {e:#}; will retry");
+                    // A pump that failed on the socket has no HTTP request to
+                    // gate, so honour the shared cooldown explicitly instead of
+                    // spinning into an already-closed limiter window.
+                    self.client.wait_for_cooldown().await;
                     tokio::time::sleep(Duration::from_millis(750)).await;
                 }
                 // Stop unless a newer write arrived while we were finishing.
@@ -1144,7 +1182,10 @@ impl SyncEngine {
         let project_id = self.client.project_id().to_string();
         let cookie = self.client.cookie_header().await;
 
-        // 1. Handshake.
+        // 1. Handshake. Deliberately outside the shared rate limiter: the
+        // `/socket.io/1/` upgrade is served by real-time, not by the web
+        // routes Overleaf throttles, and making a reconnect queue behind an
+        // entity-creation cooldown would freeze live editing for up to 45 s.
         let hs_url = format!(
             "{rt}/socket.io/1/?t={}&projectId={project_id}",
             chrono_millis()
@@ -1845,6 +1886,7 @@ impl SyncEngine {
     /// Fallback synchronisation: poll document versions and merge.
     async fn poll_loop(self: Arc<Self>) -> Result<()> {
         let mut tree_timer = tokio::time::interval(TREE_REFRESH);
+        let mut backoff = POLL_INTERVAL;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(POLL_INTERVAL) => {}
@@ -1857,8 +1899,22 @@ impl SyncEngine {
             if self.socket_up.load(std::sync::atomic::Ordering::SeqCst) {
                 continue; // socket keeps us up to date
             }
-            if let Err(e) = self.poll_once().await {
-                debug!("poll failed: {e:#}");
+            // The limiter is per user, so a poll during a cooldown competes
+            // with the entity creation the user is actually waiting for, and
+            // re-fills the window that caused the 429. Skip the round-trip.
+            if self.client.is_rate_limited() {
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
+            match self.poll_once().await {
+                Ok(()) => backoff = POLL_INTERVAL,
+                Err(e) => {
+                    // Back off instead of hammering: the previous cadence kept
+                    // `/updates` at ~86 requests/minute even while failing.
+                    backoff = (backoff * 2).min(Duration::from_secs(15));
+                    debug!("poll failed: {e:#}; retrying in {} ms", backoff.as_millis());
+                    tokio::time::sleep(backoff).await;
+                }
             }
         }
     }

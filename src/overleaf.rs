@@ -26,6 +26,7 @@ use tokio::sync::Mutex;
 use log::{debug, info, warn};
 use url::Url;
 
+use crate::ratelimit::{Endpoint, RateLimited, RateLimiter};
 use crate::types::{Doc, DocEntry, Entity, ProjectMeta, RootFolder};
 
 /// A single Overleaf project root folder (`rootFolder[0].docs` / `.fileRefs`).
@@ -78,6 +79,9 @@ pub struct OverleafClient {
     /// main host, so this is normally the same as `base`; for a bare dev stack
     /// it can point at the real-time service directly.
     realtime_base: String,
+    /// Shared rate-limit state: per-endpoint pacing plus the global cooldown a
+    /// 429 puts every request into. See `crate::ratelimit`.
+    limiter: RateLimiter,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +141,7 @@ impl OverleafClient {
             api_auth: None,
             user_id: Mutex::new(None),
             realtime_base: String::new(),
+            limiter: RateLimiter::new(),
         });
         client.handshake().await?;
         Ok(client)
@@ -211,17 +216,46 @@ impl OverleafClient {
                     .context("project token handshake")?;
                 if !res.status().is_success() {
                     let status = res.status();
+                    let retry = retry_after(res.headers());
                     let body = res.text().await.unwrap_or_default();
-                    bail!("project token rejected ({status}): {}", truncate(&body, 300));
+                    return Err(status_error(
+                        "project token handshake",
+                        Endpoint::Other,
+                        status,
+                        retry,
+                        &body,
+                    ));
                 }
                 info!("authenticated with project token (session cookie established)");
             }
             Auth::UserPass { email, password } => {
-                // 1. Session cookie + CSRF token.
+                // 1. Session cookie + CSRF token. `GET /login` is throttled per
+                // IP, so a burst of mounts (or a previous restart loop) can
+                // land on a 429 here; the shared limiter turns that into a wait.
                 let login_url = self.url("/login");
-                let page = self.get(login_url.clone()).await?;
+                let mut page_attempt = 0;
+                let page = loop {
+                    let page = self.get(login_url.clone()).await?;
+                    if page.status() == StatusCode::TOO_MANY_REQUESTS {
+                        page_attempt += 1;
+                        if page_attempt >= 6 {
+                            return Err(status_error(
+                                "login page",
+                                Endpoint::Other,
+                                page.status(),
+                                retry_after(page.headers()),
+                                "rate limited",
+                            ));
+                        }
+                        self.wait_for_cooldown().await;
+                        continue;
+                    }
+                    break page;
+                };
                 if !page.status().is_success() {
-                    bail!("could not load the login page: {}", page.status());
+                    let status = page.status();
+                    let retry = retry_after(page.headers());
+                    return Err(status_error("login page", Endpoint::Other, status, retry, ""));
                 }
                 let html = page.text().await.unwrap_or_default();
                 let csrf = extract_csrf(&html)
@@ -235,33 +269,66 @@ impl OverleafClient {
                     urlencode(&email),
                     urlencode(&password)
                 );
-                let mut req = self
-                    .http
-                    .post(login_url)
-                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(body);
-                if let Some(c) = self.cookies_header() {
-                    req = req.header(COOKIE, c);
-                }
-                req = req
-                    .header("x-csrf-token", csrf.clone())
-                    .header("referer", self.url("/login").to_string());
-                let res = req.send().await.context("login request")?;
-                self.absorb_cookies(&res);
-                let status = res.status();
-                // 302 -> follow manually so we keep the session cookie
-                if status.is_redirection() {
-                    if let Some(loc) = res.headers().get(reqwest::header::LOCATION) {
-                        let next = self
-                            .url("/")
-                            .join(loc.to_str().unwrap_or("/"))
-                            .unwrap_or_else(|_| self.url("/project"));
-                        let _ = self.get(next).await;
+                // `LoginRateLimiter` allows 10 attempts per email over 120 s and
+                // is cleared by a successful login, so a 429 here means the
+                // budget is exhausted: wait out the cooldown and try again
+                // instead of making the user rerun the mount.
+                let mut attempt = 0;
+                let (status, failure) = loop {
+                    let mut login_req = self
+                        .http
+                        .post(login_url.clone())
+                        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .body(body.clone())
+                        .header("x-csrf-token", csrf.clone())
+                        .header("referer", self.url("/login").to_string());
+                    if let Some(c) = self.cookies_header() {
+                        login_req = login_req.header(COOKIE, c);
                     }
-                }
+                    let res = self
+                        .send_once(login_req, Endpoint::Other)
+                        .await
+                        .context("login request")?;
+                    let status = res.status();
+                    if status == StatusCode::TOO_MANY_REQUESTS {
+                        attempt += 1;
+                        let wait = self.cooldown_remaining().unwrap_or_default();
+                        warn!(
+                            "login throttled (attempt {attempt}); waiting {:.0}s before retrying",
+                            wait.as_secs_f32()
+                        );
+                        self.wait_for_cooldown().await;
+                        if attempt < 6 {
+                            continue;
+                        }
+                    }
+                    // 302 -> follow manually so we keep the session cookie
+                    if status.is_redirection() {
+                        if let Some(loc) = res.headers().get(reqwest::header::LOCATION) {
+                            let next = self
+                                .url("/")
+                                .join(loc.to_str().unwrap_or("/"))
+                                .unwrap_or_else(|_| self.url("/project"));
+                            let _ = self.get(next).await;
+                        }
+                    }
+                    let body_text = if status.is_redirection() || status.is_success() {
+                        String::new()
+                    } else {
+                        res.text().await.unwrap_or_default()
+                    };
+                    break (status, body_text);
+                };
                 if !(status.is_redirection() || status.is_success()) {
-                    let text = res.text().await.unwrap_or_default();
-                    bail!("login failed ({status}): {}", truncate(&text, 300));
+                    if status == StatusCode::TOO_MANY_REQUESTS {
+                        return Err(RateLimited::new(
+                            "login",
+                            Endpoint::Other,
+                            self.cooldown_remaining(),
+                        )
+                        .into());
+                    }
+                    bail!("login failed ({status}): {}", truncate(&failure, 300));
                 }
                 info!("authenticated as {email}");
 
@@ -363,6 +430,49 @@ impl OverleafClient {
             .join("; ")
     }
 
+    /// Time left on the server-wide 429 cooldown, if one is in effect.
+    pub fn cooldown_remaining(&self) -> Option<std::time::Duration> {
+        self.limiter.cooldown_remaining()
+    }
+
+    pub fn is_rate_limited(&self) -> bool {
+        self.limiter.is_cooling_down()
+    }
+
+    /// Wait until the cooldown a 429 installed has lapsed.
+    pub async fn wait_for_cooldown(&self) {
+        self.limiter.wait_for_cooldown().await
+    }
+
+    /// Send one request through the shared limiter.
+    ///
+    /// Every HTTP request of the mount goes through here: the limiter reserves
+    /// a slot in the endpoint's window (pacing) and holds the global cooldown a
+    /// 429 installs, so a rejection on one call site slows down all of them.
+    async fn send_once(
+        &self,
+        req: reqwest::RequestBuilder,
+        endpoint: Endpoint,
+    ) -> Result<reqwest::Response> {
+        self.limiter.acquire(endpoint).await;
+        let res = self.http.execute(req.build()?).await?;
+        self.absorb_cookies(&res);
+        match res.status() {
+            StatusCode::TOO_MANY_REQUESTS => {
+                let retry_after = retry_after(res.headers());
+                let pause = self.limiter.note_rate_limited(retry_after);
+                warn!(
+                    "{} rate limit hit; pausing every request for {:.1}s",
+                    endpoint.class(),
+                    pause.as_secs_f32()
+                );
+            }
+            s if s.is_success() => self.limiter.note_success(),
+            _ => {}
+        }
+        Ok(res)
+    }
+
     async fn send_with_auth(
         &self,
         method: reqwest::Method,
@@ -385,14 +495,15 @@ impl OverleafClient {
         }
         let mut req = req;
         let mut current = url.clone();
+        let endpoint = Endpoint::classify(method.as_str(), current.path());
         for _ in 0..8 {
-            let res = req
+            let this = req
                 .try_clone()
-                .ok_or_else(|| anyhow!("request body is not reusable"))?
-                .send()
+                .ok_or_else(|| anyhow!("request body is not reusable"))?;
+            let res = self
+                .send_once(this, endpoint)
                 .await
                 .with_context(|| format!("{method} {current}"))?;
-            self.absorb_cookies(&res);
             if res.status().is_redirection() {
                 let Some(loc) = res.headers().get(reqwest::header::LOCATION) else {
                     return Ok(res);
@@ -425,8 +536,9 @@ impl OverleafClient {
         let res = self.get(url).await?;
         let status = res.status();
         if !status.is_success() {
+            let retry = retry_after(res.headers());
             let body = res.text().await.unwrap_or_default();
-            bail!("GET {path} -> {status}: {}", truncate(&body, 300));
+            return Err(status_error(format!("GET {path}"), Endpoint::Other, status, retry, &body));
         }
         let text = res.text().await?;
         serde_json::from_str(&text)
@@ -485,15 +597,19 @@ impl OverleafClient {
         let user_id = self.current_user_id().await?;
         let url = self.url(&format!("/project/{}/join", self.project_id));
         let res = self
-            .http
-            .post(url)
-            .basic_auth(user, Some(pass))
-            .json(&json!({ "userId": user_id }))
-            .send()
+            .send_once(
+                self.http
+                    .post(url)
+                    .basic_auth(user, Some(pass))
+                    .json(&json!({ "userId": user_id })),
+                Endpoint::JoinProject,
+            )
             .await
             .ok()?;
         if !res.status().is_success() {
-            return Some(Err(anyhow!("/join -> {}", res.status())));
+            let status = res.status();
+            let retry = retry_after(res.headers());
+            return Some(Err(status_error("/join", Endpoint::JoinProject, status, retry, "")));
         }
         let v: Value = res.json().await.ok()?;
         let v = v.get("project").cloned().unwrap_or(v);
@@ -544,10 +660,11 @@ impl OverleafClient {
 
     /// `GET /project/:id/updates?min_count=1` → the doc tree with versions.
     pub async fn fetch_updates(&self) -> Result<Vec<RawUpdate>> {
+        // Errors must reach the poll loop: swallowing a 429 made the loop keep
+        // polling at full speed into a closed limiter window.
         let v: Value = self
             .get_json(&format!("/project/{}/updates?min_count=1", self.project_id))
-            .await
-            .unwrap_or(Value::Array(vec![]));
+            .await?;
         let mut out = Vec::new();
         let arr = v
             .get("updates")
@@ -572,10 +689,10 @@ impl OverleafClient {
         if let Some((user, pass)) = self.api_auth.clone() {
             let url = self.url(&format!("/project/{}/doc/{}", self.project_id, doc_id));
             let res = self
-                .http
-                .get(url)
-                .basic_auth(user, Some(pass))
-                .send()
+                .send_once(
+                    self.http.get(url).basic_auth(user, Some(pass)),
+                    Endpoint::Other,
+                )
                 .await
                 .context("private API get_doc")?;
             if res.status().is_success() {
@@ -633,11 +750,13 @@ impl OverleafClient {
         });
         if let Some((user, pass)) = self.api_auth.clone() {
             let res = self
-                .http
-                .post(url)
-                .basic_auth(user, Some(pass))
-                .json(&body)
-                .send()
+                .send_once(
+                    self.http
+                        .post(url)
+                        .basic_auth(user, Some(pass))
+                        .json(&body),
+                    Endpoint::Other,
+                )
                 .await
                 .context("private API set_doc")?;
             let status = res.status();
@@ -652,8 +771,15 @@ impl OverleafClient {
             .await?;
         let status = res.status();
         if !status.is_success() {
+            let retry = retry_after(res.headers());
             let body = res.text().await.unwrap_or_default();
-            bail!("set_doc {doc_id} -> {status}: {}", truncate(&body, 300));
+            return Err(status_error(
+                format!("set_doc {doc_id}"),
+                Endpoint::Other,
+                status,
+                retry,
+                &body,
+            ));
         }
         Ok(())
     }
@@ -663,10 +789,10 @@ impl OverleafClient {
         let url = self.url(&format!("/project/{}/doc/{}", self.project_id, doc_id));
         if let Some((user, pass)) = self.api_auth.clone() {
             let res = self
-                .http
-                .delete(url.clone())
-                .basic_auth(user, Some(pass))
-                .send()
+                .send_once(
+                    self.http.delete(url.clone()).basic_auth(user, Some(pass)),
+                    Endpoint::Other,
+                )
                 .await?;
             if res.status().is_success() {
                 return Ok(());
@@ -676,7 +802,15 @@ impl OverleafClient {
             .send_with_auth(reqwest::Method::DELETE, url, None)
             .await?;
         if !res.status().is_success() {
-            bail!("delete_doc {doc_id} -> {}", res.status());
+            let status = res.status();
+            let retry = retry_after(res.headers());
+            return Err(status_error(
+                format!("delete_doc {doc_id}"),
+                Endpoint::Other,
+                status,
+                retry,
+                "",
+            ));
         }
         Ok(())
     }
@@ -701,9 +835,16 @@ impl OverleafClient {
             .send_with_auth(reqwest::Method::POST, url, Some(body))
             .await?;
         let status = res.status();
+        let retry = retry_after(res.headers());
         let text = res.text().await.unwrap_or_default();
         if !status.is_success() {
-            bail!("add_doc {name} -> {status}: {}", truncate(&text, 300));
+            return Err(status_error(
+                format!("add_doc {name}"),
+                Endpoint::AddDoc,
+                status,
+                retry,
+                &text,
+            ));
         }
         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         doc_id_from_add_response(&v).ok_or_else(|| anyhow!("add_doc: no _id in response: {}", truncate(&text, 200)))
@@ -717,9 +858,16 @@ impl OverleafClient {
             .send_with_auth(reqwest::Method::POST, url, Some(body))
             .await?;
         let status = res.status();
+        let retry = retry_after(res.headers());
         let text = res.text().await.unwrap_or_default();
         if !status.is_success() {
-            bail!("add_folder {name} -> {status}: {}", truncate(&text, 300));
+            return Err(status_error(
+                format!("add_folder {name}"),
+                Endpoint::AddFolder,
+                status,
+                retry,
+                &text,
+            ));
         }
         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         doc_id_from_add_response(&v).ok_or_else(|| anyhow!("add_folder: no _id in response"))
@@ -754,12 +902,18 @@ impl OverleafClient {
         if let Some(t) = self.csrf_token().await {
             req = req.header("x-csrf-token", t);
         }
-        let res = req.multipart(form).send().await?;
-        self.absorb_cookies(&res);
+        let res = self.send_once(req.multipart(form), Endpoint::Upload).await?;
         let status = res.status();
+        let retry = retry_after(res.headers());
         let text = res.text().await.unwrap_or_default();
         if !status.is_success() {
-            bail!("upload {name} -> {status}: {}", truncate(&text, 300));
+            return Err(status_error(
+                format!("upload {name}"),
+                Endpoint::Upload,
+                status,
+                retry,
+                &text,
+            ));
         }
         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         let id = v
@@ -806,7 +960,15 @@ impl OverleafClient {
         let url = self.url(&format!("/Project/{}/file/{}", self.project_id, file_id));
         let res = self.get(url).await?;
         if !res.status().is_success() {
-            bail!("get_file {file_id} -> {}", res.status());
+            let status = res.status();
+            let retry = retry_after(res.headers());
+            return Err(status_error(
+                format!("get_file {file_id}"),
+                Endpoint::Other,
+                status,
+                retry,
+                "",
+            ));
         }
         Ok(res.bytes().await?.to_vec())
     }
@@ -823,7 +985,15 @@ impl OverleafClient {
             .await
             .context("private API get_file_size")?;
         if !res.status().is_success() {
-            bail!("get_file_size {file_id} -> {}", res.status());
+            let status = res.status();
+            let retry = retry_after(res.headers());
+            return Err(status_error(
+                format!("get_file_size {file_id}"),
+                Endpoint::Other,
+                status,
+                retry,
+                "",
+            ));
         }
         // `Response::content_length()` reports 0 for a HEAD response (there is
         // no body to measure), so read the header itself.
@@ -873,7 +1043,15 @@ impl OverleafClient {
             .send_with_auth(reqwest::Method::DELETE, url, None)
             .await?;
         if !res.status().is_success() {
-            bail!("delete {entity_type} {entity_id} -> {}", res.status());
+            let status = res.status();
+            let retry = retry_after(res.headers());
+            return Err(status_error(
+                format!("delete {entity_type} {entity_id}"),
+                Endpoint::Other,
+                status,
+                retry,
+                "",
+            ));
         }
         Ok(())
     }
@@ -886,6 +1064,7 @@ impl OverleafClient {
         entity_type: Entity,
         entity_id: &str,
     ) -> Result<()> {
+        let endpoint = Endpoint::classify("POST", url.path());
         let mut req = self.http.request(reqwest::Method::POST, url);
         if let Some(c) = self.cookies_header() {
             req = req.header(COOKIE, c);
@@ -893,18 +1072,52 @@ impl OverleafClient {
         if let Some(t) = self.csrf_token().await {
             req = req.header("x-csrf-token", t);
         }
-        let res = req.json(&body).send().await?;
-        self.absorb_cookies(&res);
+        let res = self.send_once(req.json(&body), endpoint).await?;
         if !res.status().is_success() {
             let status = res.status();
+            let retry = retry_after(res.headers());
             let text = res.text().await.unwrap_or_default();
-            bail!(
-                "{action} {entity_type} {entity_id} -> {status}: {}",
-                truncate(&text, 200)
-            );
+            return Err(status_error(
+                format!("{action} {entity_type} {entity_id}"),
+                endpoint,
+                status,
+                retry,
+                &text,
+            ));
         }
         Ok(())
     }
+}
+
+/// `Retry-After` in seconds or as an HTTP-date. Overleaf's own limiter does not
+/// send the header (its 429 body is plain text), but nginx and other reverse
+/// proxies in front of a deployment may, so honour it when present.
+fn retry_after(headers: &HeaderMap) -> Option<std::time::Duration> {
+    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    if let Ok(secs) = value.trim().parse::<u64>() {
+        return Some(std::time::Duration::from_secs(secs));
+    }
+    let when = chrono::DateTime::parse_from_rfc2822(value.trim()).ok()?;
+    let now = chrono::Utc::now();
+    (when.with_timezone(&chrono::Utc) - now)
+        .to_std()
+        .ok()
+}
+
+/// Error for a non-success response. 429s stay typed (`RateLimited`) so the
+/// sync engine can recognise the limit instead of matching on the message.
+fn status_error(
+    action: impl Into<String>,
+    endpoint: Endpoint,
+    status: StatusCode,
+    retry_after: Option<std::time::Duration>,
+    body: &str,
+) -> anyhow::Error {
+    let action = action.into();
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return RateLimited::new(action, endpoint, retry_after).into();
+    }
+    anyhow!("{action} -> {status}: {}", truncate(body, 300))
 }
 
 fn spin_lock(jar: &Mutex<BTreeMap<String, String>>) {

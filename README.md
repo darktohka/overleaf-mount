@@ -117,6 +117,27 @@ channel the browser editor uses:
   version the op was applied *to*** (the document becomes `v+1`), and for *our
   own* edit the server omits `op` — that frame is the confirmation.
 
+### Rate limits
+
+Overleaf throttles the web routes per **user**, not per connection, so the mount
+paces all of its requests through one shared limiter (`src/ratelimit.rs`):
+
+* **Proactive pacing.** Each limited endpoint has a sliding window matching the
+  server (30 docs/min, 60 folders/min, 500 uploads/15 min, 45 `joinProject`/min).
+  A request that would exceed the window waits for a slot instead of being sent
+  and rejected. Creating a 120-file repository therefore takes a couple of
+  minutes on a fresh project; nothing is lost or retried blindly.
+* **Global cooldown.** A 429 on *any* request — including one sent by a document
+  pump, a tree refresh or the login handshake — installs a shared cooldown that
+  every request waits for, honouring `Retry-After` when present and escalating
+  the pause across consecutive rejections (3 s → 6 s → … → 45 s). The poll loop
+  skips its round-trip while the cooldown is active instead of re-filling the
+  window, and the pump loop waits for it too.
+* **Typed errors.** A 429 surfaces as `RateLimited`, so retries react to the
+  limit itself rather than matching `"429"` in a message. The login handshake
+  waits out Overleaf's login limiter (10 attempts per email per 2 minutes) and
+  retries, so a previous restart loop no longer leaves the mount unable to start.
+
 ### Conflict resolution
 
 Because our operation carries the version it was computed against,
